@@ -97,6 +97,7 @@ const OFFICE_NAV: NavItem[] = [
       { href: '/admin/winst', label: 'Winst & verbruik' },
       { href: '/admin/rapportage', label: 'Rapportage' },
       { href: '/admin/attributie', label: 'Advertentieklikken' },
+      { href: '/admin/whatsapp-advertenties', label: 'WhatsApp en advertenties' },
       { href: '/admin/klikfraude', label: 'Klikfraude' },
     ],
   },
