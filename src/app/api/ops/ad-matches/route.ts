@@ -35,7 +35,7 @@ export async function POST(request: Request) {
   if (!chats) return NextResponse.json({ error: 'Ongeldige aanvraag' }, { status: 400 });
 
   const supabase = createSupabaseAdminClient();
-  const [clicks, jobs] = await Promise.all([
+  const [clicks, jobs, leads] = await Promise.all([
     supabase
       .from('call_clicks')
       .select('ref, gclid, wbraid, gbraid, claimed_by_job_id')
@@ -45,9 +45,14 @@ export async function POST(request: Request) {
       .select('id, status, customer_phone, final_price')
       .gte('created_at', new Date(Date.now() - 180 * 86_400_000).toISOString())
       .limit(5000),
+    supabase
+      .from('leads')
+      .select('phone, phone_e164, status')
+      .gte('created_at', new Date(Date.now() - 180 * 86_400_000).toISOString())
+      .limit(5000),
   ]);
 
-  const failed = clicks.error ?? jobs.error;
+  const failed = clicks.error ?? jobs.error ?? leads.error;
   if (failed) {
     console.error('ops ad matches read failed:', failed.message);
     return NextResponse.json({ error: 'Lezen mislukt' }, { status: 500 });
@@ -62,5 +67,18 @@ export async function POST(request: Request) {
       headers: { 'Content-Type': 'application/pdf', 'Cache-Control': 'no-store' },
     });
   }
-  return NextResponse.json({ ...summarizeMatches(matches), matches });
+
+  /* Counts only: why chats do or don't reach a job, without listing anyone. */
+  const key = (value: string | null | undefined) => (value ?? '').replace(/\D/g, '').slice(-9);
+  const jobRows = (jobs.data ?? []) as JobRow[];
+  const leadRows = leads.data ?? [];
+  const leadKeys = new Set(leadRows.flatMap((l) => [key(l.phone), key(l.phone_e164)]).filter(Boolean));
+  const diagnostics = {
+    jobs: jobRows.length,
+    jobsWithPhone: jobRows.filter((j) => key(j.customer_phone)).length,
+    jobsFinished: jobRows.filter((j) => j.status === 'afgerond').length,
+    leads: leadRows.length,
+    chatsWithLead: chats.filter((c) => leadKeys.has(key(c.phone))).length,
+  };
+  return NextResponse.json({ ...summarizeMatches(matches), diagnostics, matches });
 }
