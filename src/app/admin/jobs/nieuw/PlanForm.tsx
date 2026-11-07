@@ -198,6 +198,10 @@ export default function PlanForm({
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
+    if (customerPhone.replace(/\D/g, '').length < 9) {
+      setError('Vul het telefoonnummer van de klant in (minimaal 9 cijfers).');
+      return;
+    }
     setSaving(true);
     setError('');
 

@@ -45,6 +45,8 @@ interface TelegramUpdate {
   message?: {
     chat?: { id?: number | string };
     text?: string;
+    /** Set when the technician used Telegram's "reply" on an earlier message. */
+    reply_to_message?: { text?: string };
     caption?: string;
     photo?: Array<{ file_id: string; file_size?: number }>;
     document?: { file_id: string; file_size?: number };
@@ -706,7 +708,7 @@ async function handleBidNo(query: NonNullable<TelegramUpdate['callback_query']>,
  * wanders off mid-conversation — an abandoned bid simply expires with its
  * offer.
  */
-async function handleBidPrice(chatId: number | string, text: string): Promise<boolean> {
+async function handleBidPrice(chatId: number | string, text: string, repliedTo?: string): Promise<boolean> {
   const amount = readAmount(text);
   if (amount === null) return false;
 
@@ -714,7 +716,7 @@ async function handleBidPrice(chatId: number | string, text: string): Promise<bo
   const technician = await technicianFor(supabase, chatId);
   if (!technician) return false;
 
-  const { data: waiting } = await supabase
+  const { data: waitingRows } = await supabase
     .from('job_offers')
     .select('id, job_id, bid_date, bid_start, bid_end')
     .eq('technician_id', technician.id)
@@ -723,10 +725,31 @@ async function handleBidPrice(chatId: number | string, text: string): Promise<bo
     .not('bid_date', 'is', null)
     .not('bid_start', 'is', null)
     .order('offered_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
+    .limit(10);
 
-  if (!waiting) return false;
+  const open = waitingRows ?? [];
+  if (!open.length) return false;
+
+  /*
+   * With more than one half-filled offer, "245" does not say which job it is
+   * for. Guessing (the newest) swaps the prices of two customers. The price
+   * prompt starts with the job line and the day/hour, so a Telegram reply to
+   * that prompt names the offer; otherwise ask, and write nothing.
+   */
+  let waiting = open.length === 1 ? open[0] : null;
+  const lines = await Promise.all(open.map((o) => jobLine(supabase, o.job_id)));
+  if (!waiting && repliedTo) {
+    const hits = open.filter((o, i) => repliedTo.includes(lines[i]) && repliedTo.includes(`${o.bid_date} · ${o.bid_start}`));
+    if (hits.length === 1) waiting = hits[0];
+  }
+  if (!waiting) {
+    const list = open.map((o, i) => `• ${lines[i]} · ${o.bid_date} ${o.bid_start}`).join('\n');
+    await sendTelegram(
+      String(chatId),
+      `U heeft ${open.length} klussen waarvoor nog een prijs open staat:\n${list}\n\nVoor welke klus is dit bedrag? Gebruik "Beantwoorden" op het bericht van die klus en stuur het bedrag opnieuw. Er is nog niets vastgelegd.`
+    );
+    return true;
+  }
 
   /* Same write, same confirmations as the automatic path — one function, so a
      typed bid and a bid from their own list can never report differently. */
@@ -1396,7 +1419,7 @@ export async function POST(request: Request) {
      * reply to one it asked whenever the photo came in. Asked last, answered
      * first.
      */
-    const handled = (await handleBidPrice(chatId, text)) || (await handleAmountReply(chatId, text));
+    const handled = (await handleBidPrice(chatId, text, body.message?.reply_to_message?.text)) || (await handleAmountReply(chatId, text));
     if (!handled) await sendTelegram(String(chatId), HELP);
   }
 

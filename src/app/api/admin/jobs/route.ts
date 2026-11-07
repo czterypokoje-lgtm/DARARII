@@ -61,6 +61,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Ongeldige aanvraag' }, { status: 400 });
   }
 
+  const customerPhone = text(body.customer_phone, 40);
+  if (!customerPhone || customerPhone.replace(/\D/g, '').length < 9) {
+    return NextResponse.json(
+      { error: 'Vul het telefoonnummer van de klant in (minimaal 9 cijfers). Zonder nummer kunnen we de klant niet bellen of de klus aan de aanvraag koppelen.' },
+      { status: 400 },
+    );
+  }
+
   const scheduledDate = text(body.scheduled_date, 10);
   if (!scheduledDate || !/^\d{4}-\d{2}-\d{2}$/.test(scheduledDate)) {
     return NextResponse.json({ error: 'Kies een datum' }, { status: 400 });
@@ -198,7 +206,7 @@ export async function POST(request: Request) {
     car_year: carYear,
     keyless: bool(body.keyless),
     customer_name: text(body.customer_name, 120),
-    customer_phone: text(body.customer_phone, 40),
+    customer_phone: customerPhone,
     service_type: text(body.service_type, 120),
     /* The office picks "Sleutel bijmaken" from a list; that IS the scenario,
        and without storing it as one no price list can be read for this job. */

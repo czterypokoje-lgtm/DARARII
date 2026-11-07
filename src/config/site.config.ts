@@ -59,22 +59,10 @@ export const SITE_CONFIG = {
   hoursShort: '24/7 Beschikbaar',
   responseTime: '30-60 minuten',
 
-  kvk: '42123555',
-  /*
-   * VERIFY BEFORE INVOICING. This reads as the KvK number with "NL" and "B01"
-   * around it, and that is not how a Dutch btw-identificatienummer is issued —
-   * eenmanszaken get a randomly assigned number, a BV's is built on its RSIN.
-   * A number that belongs to someone else on an invoice is their problem and
-   * ours. Replace it with the number on your own btw-aangifte.
-   */
-  btw: '', // hidden everywhere until the real btw-id from the Belastingdienst is filled in
-  /*
-   * VERIFY BEFORE INVOICING — same placeholder problem as kvk/btw above. A
-   * factuur with someone else's bank account on it is a mistake, not just a
-   * blank field. Replace with the real account before this is used to bill
-   * anyone; the invoice form lets each factuur override it anyway.
-   */
-  iban: 'NL00BANK0123456789',
+  // Verified against the Moneybird import (Nov 2026).
+  kvk: '42155437',
+  btw: 'NL005540539B12',
+  iban: 'NL58BUNQ2211494455',
   rating: '5.0',
   reviewCount: '10', // actual Google review count — update as it grows
 
