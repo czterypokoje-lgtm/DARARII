@@ -447,6 +447,11 @@ const SERVICE_KEY =
 /** True when a visit can actually be recorded. */
 export const clickFraudConfigured = Boolean(SUPABASE_REST && SERVICE_KEY);
 
+/* A new sb_secret_ key is not a JWT and is refused as a Bearer token. */
+const SERVICE_HEADERS: Record<string, string> = SERVICE_KEY.startsWith('sb_')
+  ? { apikey: SERVICE_KEY }
+  : { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}` };
+
 /**
  * Fire-and-forget insert. Returns false instead of throwing: a landing page
  * must never fail, or go slow, because the evidence table was unreachable.
@@ -457,8 +462,7 @@ export async function recordAdVisit(row: Record<string, unknown>): Promise<boole
     const res = await fetch(`${SUPABASE_REST}/ad_visits`, {
       method: 'POST',
       headers: {
-        apikey: SERVICE_KEY,
-        Authorization: `Bearer ${SERVICE_KEY}`,
+        ...SERVICE_HEADERS,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
@@ -490,8 +494,7 @@ export async function markAdVisitHuman(
     const res = await fetch(`${SUPABASE_REST}/ad_visits?${params}`, {
       method: 'PATCH',
       headers: {
-        apikey: SERVICE_KEY,
-        Authorization: `Bearer ${SERVICE_KEY}`,
+        ...SERVICE_HEADERS,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal',
       },
