@@ -1,7 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
-import { NextResponse } from 'next/server';
+import { NextResponse, after } from 'next/server';
 import { rateLimit, getClientIp, tooManyRequests } from '@/lib/rateLimit';
 import { validLeadToken } from '@/lib/leadToken';
+import { notifyLeadDetails } from '@/lib/leadNotify';
 
 /*
  * Follow-up answers for a lead the hero wizard already saved.
@@ -33,14 +34,34 @@ export async function POST(request: Request) {
   const update: Record<string, unknown> = {};
   const service = text(body?.service, 120);
   if (service) update.service = service;
-  const price = Number(body?.quotedPrice);
-  if (Number.isFinite(price) && price > 0 && price < 10000) update.quoted_price = price;
+  const quoted = Number(body?.quotedPrice);
+  if (Number.isFinite(quoted) && quoted > 0 && quoted < 10000) update.quoted_price = quoted;
   if (!Object.keys(update).length) return NextResponse.json({ success: true });
 
-  const { error } = await createClient(url, key).from('leads').update(update).eq('id', id);
+  const supabase = createClient(url, key);
+  const columns = 'id, name, phone, brand, model, year, service, quoted_price';
+  const { data: before } = await supabase.from('leads').select(columns).eq('id', id).maybeSingle();
+
+  const { data: lead, error } = await supabase
+    .from('leads')
+    .update(update)
+    .eq('id', id)
+    .select(columns)
+    .maybeSingle();
   if (error) {
     console.error('lead details update failed', error.code);
     return NextResponse.json({ error: 'Opslaan mislukt' }, { status: 500 });
+  }
+
+  /* Only on a real change: the wizard can resend the same answer after Back. */
+  const price = (row: { quoted_price: unknown } | null) =>
+    row?.quoted_price == null ? null : Number(row.quoted_price);
+  if (lead && (lead.service !== before?.service || price(lead) !== price(before))) {
+    after(() =>
+      notifyLeadDetails({ ...lead, quoted_price: price(lead) }).catch((notifyError) =>
+        console.error('[leads] details alert failed', id, notifyError)
+      )
+    );
   }
   return NextResponse.json({ success: true });
 }

@@ -236,6 +236,7 @@ export async function POST(request: Request) {
       try {
         await notifyNewLead({
           ...enrichedRow,
+          id: leadId,
           location,
           status: initialStatus ?? 'new',
         });

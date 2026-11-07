@@ -1086,7 +1086,7 @@ async function handleOfficeChoice(query: NonNullable<TelegramUpdate['callback_qu
   if (what === 'leads') {
     const { data } = await supabase
       .from('leads')
-      .select('id, name, phone, brand, model, postcode, status, created_at, first_contact_at')
+      .select('id, name, phone, brand, model, service, quoted_price, postcode, status, created_at, first_contact_at')
       .in('status', ['new', 'qualified'])
       .order('created_at', { ascending: false })
       .limit(5);
@@ -1101,6 +1101,8 @@ async function handleOfficeChoice(query: NonNullable<TelegramUpdate['callback_qu
         `📥 ${lead.name?.trim() || 'Naam onbekend'}`,
         [
           ['Auto', [lead.brand, lead.model].filter(Boolean).join(' ')],
+          ['Dienst', lead.service],
+          ['Richtprijs getoond', lead.quoted_price == null ? null : euro(lead.quoted_price)],
           ['Telefoon', lead.phone],
           ['Postcode', lead.postcode],
           ['Binnen', `${age} uur geleden`],

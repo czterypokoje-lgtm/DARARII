@@ -2,6 +2,7 @@ import 'server-only';
 import { SITE_CONFIG } from '@/config/site.config';
 import { sendMail } from './email';
 import { sendTelegram, sendTelegramLead } from './telegram';
+import { block, esc, euro } from './telegramText';
 
 /**
  * Tell the office a lead just came in.
@@ -44,8 +45,6 @@ export interface LeadAlert {
   quoted_price?: number | null;
   status?: string | null;
 }
-
-const euro = (value: number) => `€${value.toFixed(2).replace('.', ',')}`;
 
 /** "Volkswagen Golf 2016", or null when the form did not ask. */
 function carLine(lead: LeadAlert): string | null {
@@ -95,6 +94,43 @@ function compose(lead: LeadAlert): { subject: string; text: string } {
   return { subject, text: lines.join('\n') };
 }
 
+/** Every office chat: the one in the environment plus everyone connected. */
+async function officeChats(): Promise<Set<string>> {
+  const chats = new Set<string>();
+  if (process.env.TELEGRAM_OFFICE_CHAT_ID) chats.add(process.env.TELEGRAM_OFFICE_CHAT_ID);
+
+  try {
+    const { createSupabaseAdminClient } = await import('./supabase/admin');
+    const { data } = await createSupabaseAdminClient()
+      .from('admin_telegram')
+      .select('telegram_chat_id');
+    for (const row of data ?? []) chats.add(String(row.telegram_chat_id));
+  } catch (error) {
+    /* The env chat still gets it; a missing service key must not cost the
+       alert entirely. */
+    console.error('[lead-alert] admin_telegram lookup failed:', error);
+  }
+  return chats;
+}
+
+/**
+ * The hero wizard alerts at the phone number, before the customer has chosen
+ * a job or seen a price. Those answers arrive later on the same row, so this
+ * follows up with them; otherwise Telegram stays on "Nog te bepalen" while the
+ * CRM shows the real service.
+ */
+export async function notifyLeadDetails(lead: LeadAlert): Promise<void> {
+  if (!process.env.TELEGRAM_BOT_TOKEN || !lead.id) return;
+
+  const text = block(`Lead aangevuld — ${lead.name?.trim() || 'Naam niet opgegeven'}`, [
+    ['Telefoon', lead.phone],
+    ['Auto', carLine(lead)],
+    ['Dienst', lead.service],
+    ['Richtprijs getoond', typeof lead.quoted_price === 'number' ? euro(lead.quoted_price) : null],
+  ]);
+  for (const chat of await officeChats()) await sendTelegramLead(chat, text, String(lead.id));
+}
+
 /**
  * Fire the alert. Returns which channels actually delivered, so the caller
  * can log a lead that reached nobody rather than assuming it was seen.
@@ -102,7 +138,6 @@ function compose(lead: LeadAlert): { subject: string; text: string } {
 export async function notifyNewLead(lead: LeadAlert): Promise<{ mail: boolean; telegram: boolean }> {
   const { subject, text } = compose(lead);
 
-  const officeChat = process.env.TELEGRAM_OFFICE_CHAT_ID;
   const officeMail = process.env.LEAD_ALERT_EMAIL ?? SITE_CONFIG.email;
 
   /* Both at once: neither is on the other's critical path, and a lead alert
@@ -133,25 +168,13 @@ export async function notifyNewLead(lead: LeadAlert): Promise<{ mail: boolean; t
        * called can be recorded from the notification instead of from a laptop
        * somebody is not sitting at.
        */
-      const chats = new Set<string>();
-      if (officeChat) chats.add(officeChat);
-
-      try {
-        const { createSupabaseAdminClient } = await import('./supabase/admin');
-        const { data } = await createSupabaseAdminClient()
-          .from('admin_telegram')
-          .select('telegram_chat_id');
-        for (const row of data ?? []) chats.add(String(row.telegram_chat_id));
-      } catch (error) {
-        /* The env chat still gets it; a missing service key must not cost the
-           alert entirely. */
-        console.error('[lead-alert] admin_telegram lookup failed:', error);
-      }
-
+      const chats = await officeChats();
       if (!chats.size) return false;
+      /* Escaped because a stray `&` or `<` in a name makes Telegram refuse the
+         whole message, and the mail keeps the plain text. */
       for (const chat of chats) {
-        if (lead.id) await sendTelegramLead(chat, text, String(lead.id));
-        else await sendTelegram(chat, text);
+        if (lead.id) await sendTelegramLead(chat, esc(text), String(lead.id));
+        else await sendTelegram(chat, esc(text));
       }
       return true;
     })().catch(() => false),
