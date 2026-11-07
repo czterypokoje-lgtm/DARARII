@@ -21,7 +21,9 @@ export async function GET(request: Request) {
       .from('leads')
       .select(LEAD_COLUMNS)
       .in('status', ['new', 'contacted', 'qualified'])
-      .gte('created_at', since)
+      /* Unanswered leads stay until someone answers them, however old. */
+      .or(`status.eq.new,created_at.gte.${since}`)
+      .order('created_at', { ascending: false })
       .limit(500),
     supabase
       .from('agent_conversations')
@@ -29,7 +31,8 @@ export async function GET(request: Request) {
       .gte('created_at', since)
       .not('phone', 'is', null)
       .limit(500),
-    supabase.from('jobs').select('customer_phone').gte('created_at', since).limit(1000),
+    /* Every job, not only recent ones: an old lead whose number booked is not waiting. */
+    supabase.from('jobs').select('customer_phone').order('created_at', { ascending: false }).limit(2000),
   ]);
 
   const failed = leads.error ?? conversations.error ?? jobs.error;

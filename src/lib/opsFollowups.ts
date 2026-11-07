@@ -49,7 +49,7 @@ export interface Followup {
 export const FOLLOWUP_RULES = {
   /** A lead nobody answered, after this long, is a lead going cold. */
   unansweredAfterMinutes: 15,
-  /** Contacted but never booked: chase after a day, give up after two weeks. */
+  /** Contacted but never booked: chase after a day, give up after two weeks. Unanswered leads never expire. */
   noBookingAfterMinutes: 24 * 60,
   noBookingUntilMinutes: 14 * 24 * 60,
   /** An agent conversation with no lead or job behind it, within a week. */
