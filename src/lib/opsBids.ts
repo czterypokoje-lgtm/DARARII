@@ -1,8 +1,14 @@
 /** The owner's margin on a technician's bid. */
 export const MARGIN = 0.25;
 
-/** Whole euros, rounded up so the margin is never below 25%. */
+/** Btw on top of the customer price. */
+export const VAT_RATE = 0.21;
+
+/** Excluding btw, in whole euros, rounded up so the margin is never below 25%. */
 export const customerPrice = (bid: number) => Math.ceil(Math.round(bid * (1 + MARGIN) * 100) / 100);
+
+/** What the customer pays. */
+export const customerPriceInclVat = (bid: number) => Math.round(customerPrice(bid) * (1 + VAT_RATE) * 100) / 100;
 
 export interface BidRow {
   id: string;
@@ -43,6 +49,7 @@ export function summarizeBids(bids: BidRow[], jobs: BidJob[]) {
         technician: firstName(bid.technicians),
         bid: amount,
         customerPrice: customerPrice(amount),
+        customerPriceInclVat: customerPriceInclVat(amount),
         when: [bid.bid_date, bid.bid_start, bid.bid_end].filter(Boolean).join(' ') || null,
       },
     ];
