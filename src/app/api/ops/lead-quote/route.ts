@@ -29,7 +29,9 @@ export async function GET(request: Request) {
   if (!lead) return NextResponse.json({ error: 'Niet gevonden' }, { status: 404 });
 
   const scenario = scenarioFromLabel(lead.service);
-  const car = { make: lead.brand, model: lead.model, year: null };
+  /* Plate forms store "SK913S — CLIO": only the part after the dash is the model. */
+  const model = lead.model?.split('—').pop()?.trim() || null;
+  const car = { make: lead.brand, model, year: null };
   if (!scenario || !lead.brand) return NextResponse.json({ car, scenario, prices: [] });
 
   const [technicians, coverage] = await Promise.all([
