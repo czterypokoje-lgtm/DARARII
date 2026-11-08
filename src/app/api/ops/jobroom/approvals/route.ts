@@ -9,7 +9,10 @@ export async function GET(request: Request) {
 }
 
 /**
- * Releases or refuses one exact text (bound to its hash) for an approver identified by number. Shadow: nothing is sent. */
+ * Releases or refuses one exact row. The body is a signed approval token from
+ * the verified approval channel (JOBROOM_APPROVAL_SECRET); the ops token alone
+ * approves nothing. Shadow: nothing is sent.
+ */
 export async function POST(request: Request) {
   return runOps(request, createSupabaseAdminClient, 'jobroom.approval', (db, body) =>
     decideApproval(db, body)

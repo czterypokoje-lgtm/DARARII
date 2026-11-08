@@ -1,3 +1,5 @@
+import { maskPhones, maskSensitive } from './jobRoomGuard.ts';
+
 /**
  * Live view and office view over the job room (slice S8).
  *
@@ -78,13 +80,7 @@ export function outboxDeskOf(o: Pick<OutboxRow, 'kind' | 'audience'>): DeskKey {
   return 'quote';
 }
 
-/** Any run of 9 or more digits (a phone number) shows only its last 4. */
-export function maskPhones(text: string): string {
-  return text.replace(/\+?\d[\d\s().-]{5,}\d/g, (m) => {
-    const digits = m.replace(/\D/g, '');
-    return digits.length >= 9 ? `••••${digits.slice(-4)}` : m;
-  });
-}
+export { maskPhones };
 
 const amsterdamHour = (now: Date) =>
   Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Amsterdam', hour: '2-digit', hour12: false }).format(now)) % 24;
@@ -169,6 +165,6 @@ export function buildOffice(
 
 /** One feed line: what happened, with any number masked. The exact text stays in the database. */
 export function feedText(e: Pick<EventRow, 'body'>, max = 300): string {
-  const text = maskPhones(e.body ?? '').replace(/\s+/g, ' ').trim();
+  const text = maskSensitive(e.body ?? '').replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }

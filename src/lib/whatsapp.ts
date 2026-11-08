@@ -8,6 +8,8 @@
  * tried in this same file).
  */
 
+import { guardText } from './jobRoomGuard.ts';
+
 /**
  * "06 11 75 12 31" -> "31611751231".
  *
@@ -62,8 +64,13 @@ const time = (value: string | null | undefined) => (value ? String(value).slice(
  * never agreed is worse than one who has to ask.
  */
 export function jobBriefing(job: JobBriefing, stage: 'offer' | 'assigned' = 'offer'): string {
-  // Before the award the technician never gets the customer's number (never-rule).
+  // Before the award the technician never gets the customer's number (never-rule),
+  // and free text a customer typed (name, street, notes) is dropped if it holds a
+  // phone number, email, plate or key: it could be used to pass contact details.
   const customerPhone = stage === 'assigned' ? job.customer_phone : null;
+  const safe = (text: string | null | undefined) =>
+    stage === 'assigned' || !text || guardText(text, 'technician') === null ? text : null;
+  job = { ...job, street: safe(job.street), notes: safe(job.notes), customer_name: safe(job.customer_name) };
   const when = [job.scheduled_date, [time(job.slot_start), time(job.slot_end)].filter(Boolean).join('–')]
     .filter(Boolean)
     .join(' ');

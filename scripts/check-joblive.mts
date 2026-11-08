@@ -76,6 +76,7 @@ desks = buildOffice(events, outbox, heartbeatStatus([{ service: 'transport', bea
 assert.equal(desk('transport').state, 'error', 'a late heartbeat turns its desk red');
 
 // --- Heartbeat routes' logic, with an alert that only records ---
+const clock = { now: new Date() };
 function stubDb() {
   const t: Row[] = [];
   const from = () => {
@@ -95,12 +96,26 @@ function stubDb() {
     };
     return b;
   };
-  return { db: { from } as any, t };
+  // job_heartbeat_claim_alert as the database runs it: one statement, so only one caller wins.
+  const rpc = async (name: string, args: Row) => {
+    if (name !== 'job_heartbeat_claim_alert') return { data: null, error: { message: 'unknown rpc' } };
+    let row = t.find((r) => r.service === args.p_service);
+    if (!row) t.push((row = { service: args.p_service, beat_at: '1970-01-01T00:00:00Z', alerted_at: null }));
+    const now = clock.now;
+    if (row.alerted_at && Date.parse(row.alerted_at) > now.getTime() - args.p_minutes * 60_000) return { data: false, error: null };
+    row.alerted_at = now.toISOString();
+    return { data: true, error: null };
+  };
+  return { db: { from, rpc } as any, t };
 }
 const { db, t } = stubDb();
 const sent: string[] = [];
 const notify = async (text: string) => void sent.push(text);
-const opts = (over = {}) => ({ expected: ['transport'], alert: true, alertsOn: true, notify, now: noon, ...over });
+const opts = (over: Row = {}) => {
+  const o = { expected: ['transport'], alert: true, alertsOn: true, notify, now: noon, ...over };
+  clock.now = o.now as Date;
+  return o;
+};
 
 assert.equal((await recordHeartbeat(db, { service: 'Bad Name' })).status, 400);
 assert.equal((await recordHeartbeat(db, { service: 'transport', note: 'ok' })).status, 200);
@@ -133,5 +148,17 @@ assert.match(sent[2], /nog nooit/);
 assert.equal(empty.t.length, 1, 'a placeholder row keeps it from repeating');
 r = await checkHeartbeats(empty.db, opts());
 assert.equal(sent.length, 3);
+
+// Two checks at the same moment: one alert, not two
+{
+  const racing = stubDb();
+  const before = sent.length;
+  await Promise.all([checkHeartbeats(racing.db, opts()), checkHeartbeats(racing.db, opts())]);
+  assert.equal(sent.length - before, 1, 'overlapping checks cannot double-alert');
+  // A failing Telegram send is reported, not thrown, and not retried within the hour
+  const failing = stubDb();
+  const res = await checkHeartbeats(failing.db, opts({ notify: async () => { throw new Error('telegram down'); } }));
+  assert.deepEqual(res.body.failed, ['transport']);
+}
 
 console.log('check-joblive: all passed');

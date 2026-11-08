@@ -1,6 +1,7 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { checkOps, logOps } from './opsAuth.ts';
+import { guardText, maskSecrets, type Audience } from './jobRoomGuard.ts';
 import { heartbeatStatus } from './jobRoomLive.ts';
 import { toE164NL } from './phone.ts';
 
@@ -64,30 +65,28 @@ export const sha256 = (text: string) => createHash('sha256').update(text, 'utf8'
 export const dedupeKey = (jobRoomId: string, contactId: string, kind: string, textHash: string) =>
   sha256([jobRoomId, contactId, kind, textHash].join('\u001f'));
 
-export type Audience = 'customer_reply' | 'technician' | 'self_started' | 'internal';
-const AUDIENCES = ['customer_reply', 'technician', 'self_started', 'internal'] as const;
+export { guardText };
+export type { Audience };
 
-const PHONE_CANDIDATE = /\+?\d[\d\s().-]{6,}\d/g;
-/** Nine digits or more in one run: a phone number, not a date (8 digits) or a price. */
-const hasPhone = (text: string) =>
-  (text.match(PHONE_CANDIDATE) ?? []).some((m) => m.replace(/\D/g, '').length >= 9);
-const EMAIL = /[^\s@]+@[^\s@]+\.[a-z]{2,}/i;
-const PLATE = /\b(?:[A-Z0-9]{2}-[A-Z0-9]{2}-[A-Z0-9]{2}|[A-Z]{1,3}-\d{2,3}-[A-Z]{1,2}|\d-[A-Z]{3}-\d{2})\b/i;
-const SECRET = /sk-ant-|sb_secret_|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{20,}\./;
+/** Stable JSON: keys sorted, so a jsonb round trip does not change a hash. */
+export function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
+  if (isObject(v)) return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`;
+  return JSON.stringify(v ?? null);
+}
 
 /**
- * Never-rules, at the moment a row is proposed. A message to a customer or a
- * technician may hold no phone number, email address or licence plate, and no
- * key-like string anywhere. Internal messages (owner, assistant) may; a key
- * string is refused everywhere. Returns the reason, or null when clean.
+ * What an approver actually approves: the job, the recipient, the audience, the
+ * tier, the kind, the exact text and the attachment. Stored as the row's
+ * text_hash and re-computed at decision time (and by the transport before it
+ * sends), so a row that was changed after the card was shown fails the check.
  */
-export function guardText(text: string, audience: Audience): string | null {
-  if (SECRET.test(text)) return 'secret';
-  if (audience === 'internal') return null;
-  if (hasPhone(text)) return 'phone';
-  if (EMAIL.test(text)) return 'email';
-  if (PLATE.test(text)) return 'plate';
-  return null;
+export function outboxBindingHash(o: {
+  job_room_id: string; contact_id: string; audience: string; tier: number; kind: string; body: string; attachment?: unknown;
+}): string {
+  return sha256(
+    canonical([o.job_room_id, o.contact_id, o.audience, Number(o.tier), o.kind, o.body, sha256(canonical(o.attachment ?? null))])
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -318,13 +317,24 @@ const roomBody = (r: Row, created: boolean) => ({
 const CHANNELS = ['whatsapp', 'telegram', 'crm', 'voice', 'system'] as const;
 const DIRECTIONS = ['in', 'out', 'internal'] as const;
 
-/** POST: one row per message in or out. A replay (same provider message id) is a harmless no-op. */
+/** Who may write events through the route. Internal refusal and block events are written by this module only. */
+const EVENT_ACTORS = ['transport', 'wacli', 'intake', 'translator', 'quote-relay', 'dispatcher', 'invoice', 'reports', 'doctor', 'crm'] as const;
+const EVENT_KIND = /^[a-z][a-z0-9._-]{1,59}$/;
+const RESERVED_KIND = /^(approval|outbox|heartbeat)\./;
+const PROVIDER_ID = /^[\w.:@=+/-]{1,200}$/;
+
+/**
+ * POST: one row per message in or out. A replay (same provider message id) is a
+ * harmless no-op. The caller picks from a short list of actors and may not use
+ * the kinds this module writes itself; the status is always `recorded`.
+ * Anything key-like in the text is masked before it is stored.
+ */
 export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promise<Result> {
   if (!isObject(raw)) return bad('Ongeldige invoer');
   const direction = oneOf(raw.direction, DIRECTIONS);
   const channel = oneOf(raw.channel, CHANNELS);
-  const actor = clean(raw.actor, 80);
-  const kind = clean(raw.kind, 80);
+  const actor = oneOf(raw.actor, EVENT_ACTORS);
+  const kind = typeof raw.kind === 'string' && EVENT_KIND.test(raw.kind) && !RESERVED_KIND.test(raw.kind) ? raw.kind : null;
   if (!direction || !channel || !actor || !kind) return bad('Ongeldige gebeurtenis');
   if (raw.jobRoomId !== undefined && raw.jobRoomId !== null && !isUuid(raw.jobRoomId)) {
     return bad('Ongeldige klus');
@@ -332,8 +342,11 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
   if (raw.contactId !== undefined && raw.contactId !== null && !isUuid(raw.contactId)) {
     return bad('Ongeldig contact');
   }
+  const providerId = raw.providerMessageId === undefined ? null : String(raw.providerMessageId);
+  if (providerId !== null && !PROVIDER_ID.test(providerId)) return bad('Ongeldig bericht-id');
+  const eventKey = clean(raw.eventKey, 150);
 
-  const body = typeof raw.body === 'string' ? raw.body.slice(0, 8000) : null;
+  const body = typeof raw.body === 'string' ? maskSecrets(raw.body.slice(0, 8000)) : null;
   const row = {
     job_room_id: (raw.jobRoomId as string | null | undefined) ?? null,
     contact_id: (raw.contactId as string | null | undefined) ?? null,
@@ -341,11 +354,12 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
     channel,
     actor,
     kind,
-    provider_message_id: clean(raw.providerMessageId, 200),
-    event_key: clean(raw.eventKey, 200),
+    provider_message_id: providerId,
+    // Scoped per source, so one caller cannot block another's keys.
+    event_key: eventKey ? `${actor}:${eventKey}` : null,
     body,
     meta: isObject(raw.meta) ? raw.meta : {},
-    status: oneOf(raw.status, ['recorded', 'processed', 'blocked', 'error'] as const) ?? 'recorded',
+    status: 'recorded',
   };
   const ins = await supabase.from('job_events').insert(row).select('id').single();
   if (ins.error?.code === '23505') return ok({ duplicate: true });
@@ -357,65 +371,137 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
 // Outbox (shadow) and approvals
 // ---------------------------------------------------------------------------
 
-/**
- * POST: propose one message. Shadow only: the row is stored as `proposed` with
- * shadow = true and never moves past `approved`. A text that breaks a
- * never-rule is not stored as outbox; it is logged as a blocked event instead.
- */
-export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Promise<Result> {
-  if (!isObject(raw)) return bad('Ongeldige invoer');
-  if (!isUuid(raw.jobRoomId)) return bad('Ongeldige klus');
-  if (!isUuid(raw.contactId)) return bad('Ongeldig contact');
-  const audience = oneOf(raw.audience, AUDIENCES);
-  const kind = clean(raw.kind, 80);
-  const body = clean(raw.body, 4000);
-  const tier = typeof raw.tier === 'number' && [0, 1, 2].includes(raw.tier) ? raw.tier : null;
-  if (!audience || !kind || !body || tier === null) return bad('Ongeldig bericht');
+const TIER0_KINDS = new Set(['intake_question', 'ack', 'review_request', 'on_my_way']);
+const GENERIC_KIND = /^[a-z][a-z0-9._-]{0,79}$/;
 
-  const refused = guardText(body, audience);
+/** Who a message goes to decides which rules apply. The caller cannot choose `internal`. */
+function audienceFor(role: string, hint: unknown): Audience {
+  if (role === 'customer') return hint === 'customer_reply' ? 'customer_reply' : 'self_started';
+  if (role === 'technician' || role === 'garage') return 'technician';
+  return 'internal'; // staff and owner only
+}
+
+type OutboxInput = {
+  jobRoomId: string; contactId: string; audience: Audience; kind: string; tier: number; body: string; attachment?: Row | null;
+};
+
+/**
+ * The one place an outbox row is written. Guards the text, binds the hash to
+ * everything an approver sees, and dedupes. Shadow only: `proposed`,
+ * shadow = true, never past `approved`. A refused text is logged as a blocked
+ * event (reason only) instead of being stored.
+ */
+async function insertOutbox(supabase: SupabaseClient, p: OutboxInput): Promise<Result> {
+  const refused = guardText(p.body, p.audience);
   if (refused) {
     await supabase.from('job_events').insert({
-      job_room_id: raw.jobRoomId,
-      contact_id: raw.contactId,
+      job_room_id: p.jobRoomId,
+      contact_id: p.contactId,
       direction: 'internal',
       channel: 'system',
       actor: 'jobroom-guard',
       kind: 'outbox.blocked',
       status: 'blocked',
-      meta: { reason: refused, audience, kind },
+      meta: { reason: refused, audience: p.audience, kind: p.kind.split(':')[0] },
     });
     return bad('Bericht geblokkeerd', 422, { reason: refused });
   }
+  if (p.attachment && Buffer.byteLength(JSON.stringify(p.attachment), 'utf8') > 2000) return bad('Bijlage te groot', 422);
 
-  // Metadata only (what is attached, and a hash of it). Needs migration 0079,
-  // so the column is written only when a caller sends one.
-  const attachment = isObject(raw.attachment) && JSON.stringify(raw.attachment).length <= 2000 ? raw.attachment : null;
-
-  const textHash = sha256(body);
-  const key = dedupeKey(raw.jobRoomId, raw.contactId, kind, textHash);
+  const key = dedupeKey(p.jobRoomId, p.contactId, p.kind, sha256(p.body));
+  const textHash = outboxBindingHash({
+    job_room_id: p.jobRoomId, contact_id: p.contactId, audience: p.audience, tier: p.tier, kind: p.kind, body: p.body, attachment: p.attachment,
+  });
   const ins = await supabase
     .from('job_outbox')
     .insert({
-      job_room_id: raw.jobRoomId,
-      contact_id: raw.contactId,
-      audience,
-      kind,
-      tier,
-      body,
+      job_room_id: p.jobRoomId,
+      contact_id: p.contactId,
+      audience: p.audience,
+      kind: p.kind,
+      tier: p.tier,
+      body: p.body,
       text_hash: textHash,
       dedupe_key: key,
       state: 'proposed',
       shadow: true,
-      ...(attachment ? { attachment } : {}),
+      // Needs migration 0079; written only when there is something to attach.
+      ...(p.attachment ? { attachment: p.attachment } : {}),
     })
     .select('id, state')
     .single();
   if (ins.error?.code === '23505') {
-    const existing = await supabase.from('job_outbox').select('id, state').eq('dedupe_key', key).maybeSingle();
-    if (existing.data) return ok({ outboxId: existing.data.id, state: existing.data.state, duplicate: true });
+    const existing = await supabase.from('job_outbox').select('id, state, text_hash').eq('dedupe_key', key).maybeSingle();
+    if (existing.data) {
+      return ok({ outboxId: existing.data.id, state: existing.data.state, textHash: existing.data.text_hash, duplicate: true });
+    }
   }
   if (ins.error || !ins.data) return bad('Opslaan mislukt', 500);
-  return ok({ outboxId: ins.data.id, state: ins.data.state, duplicate: false, shadow: true }, 201);
+  return ok({ outboxId: ins.data.id, state: ins.data.state, textHash, duplicate: false, shadow: true }, 201);
+}
+
+/** The job's customer or a listed party, nobody else. */
+async function isParty(supabase: SupabaseClient, room: Row, contactId: string): Promise<boolean> {
+  if (room.customer_contact_id === contactId) return true;
+  const party = await supabase.from('job_parties').select('id').eq('job_room_id', room.id).eq('contact_id', contactId).maybeSingle();
+  return Boolean(party.data);
+}
+
+/**
+ * POST: propose one message (the generic route). The audience comes from the
+ * recipient's role, the recipient must belong to the job, and invoice rules
+ * cannot be reached from here: no attachment, no invoice kind, and tier 0 (no
+ * approval) only for the few fixed-text kinds.
+ */
+export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Promise<Result> {
+  if (!isObject(raw)) return bad('Ongeldige invoer');
+  if (!isUuid(raw.jobRoomId)) return bad('Ongeldige klus');
+  if (!isUuid(raw.contactId)) return bad('Ongeldig contact');
+  if (raw.attachment !== undefined && raw.attachment !== null) return bad('Bijlage niet toegestaan', 422);
+  const kind = typeof raw.kind === 'string' && GENERIC_KIND.test(raw.kind) ? raw.kind : null;
+  const body = clean(raw.body, 4000);
+  const tier = typeof raw.tier === 'number' && [0, 1, 2].includes(raw.tier) ? raw.tier : null;
+  if (!kind || !body || tier === null) return bad('Ongeldig bericht');
+  if (/invoice|factuur/i.test(kind)) return bad('Gereserveerde soort', 422);
+  if (tier === 0 && !TIER0_KINDS.has(kind)) return bad('Tier 0 niet toegestaan voor deze soort', 422);
+
+  const room = await supabase.from('job_rooms').select('id, customer_contact_id').eq('id', raw.jobRoomId).maybeSingle();
+  if (room.error) return bad('Ophalen mislukt', 500);
+  if (!room.data) return bad('Klus niet gevonden', 404);
+  const contact = await supabase.from('contacts').select('id, role, active').eq('id', raw.contactId).maybeSingle();
+  if (contact.error) return bad('Ophalen mislukt', 500);
+  if (!contact.data || contact.data.active === false) return bad('Contact niet gevonden', 404);
+  if (!(await isParty(supabase, room.data, raw.contactId))) return bad('Contact hoort niet bij deze klus', 403);
+
+  return insertOutbox(supabase, {
+    jobRoomId: raw.jobRoomId,
+    contactId: raw.contactId,
+    audience: audienceFor(String(contact.data.role), raw.audience),
+    kind,
+    tier,
+    body,
+  });
+}
+
+/** POST: add a person to a job (a technician who is offered it, an assistant). The role must fit the contact. */
+export async function addParty(supabase: SupabaseClient, raw: unknown): Promise<Result> {
+  if (!isObject(raw)) return bad('Ongeldige invoer');
+  if (!isUuid(raw.jobRoomId)) return bad('Ongeldige klus');
+  if (!isUuid(raw.contactId)) return bad('Ongeldig contact');
+  const role = oneOf(raw.role, ['customer', 'technician', 'assistant', 'owner'] as const);
+  if (!role) return bad('Ongeldige rol');
+  const fits: Record<string, string[]> = {
+    customer: ['customer'], technician: ['technician', 'garage'], assistant: ['staff'], owner: ['owner'],
+  };
+  const [room, contact] = await Promise.all([
+    supabase.from('job_rooms').select('id').eq('id', raw.jobRoomId).maybeSingle(),
+    supabase.from('contacts').select('id, role').eq('id', raw.contactId).maybeSingle(),
+  ]);
+  if (!room.data || !contact.data) return bad('Niet gevonden', 404);
+  if (!fits[role].includes(String(contact.data.role))) return bad('Rol past niet bij het contact', 409);
+  const ins = await supabase.from('job_parties').insert({ job_room_id: raw.jobRoomId, contact_id: raw.contactId, role });
+  if (ins.error && ins.error.code !== '23505') return bad('Opslaan mislukt', 500);
+  return ok({ added: !ins.error }, ins.error ? 200 : 201);
 }
 
 /** GET: the queue, newest first, so the transport (and the owner) can see what is waiting. */
@@ -441,13 +527,60 @@ export async function listOutbox(
 export const approvalTtlHours = () => Number(process.env.JOBROOM_APPROVAL_TTL_HOURS) || 24;
 const WAITING_MINUTES = 15;
 
+// --- Approval token -----------------------------------------------------------
+//
+// An approval is not a field in a JSON body. It is a short-lived token signed
+// with JOBROOM_APPROVAL_SECRET, issued by the verified approval channel
+// (tech-listen for the assistant, the owner's own channel for the owner). The
+// proposing side (the transport, an assistant's process) holds only the ops
+// token, so it cannot approve what it proposed. Who approves, how, what and
+// which exact hash all travel inside the signature.
+
+export type ApprovalClaim = {
+  o: string; // outbox id
+  h: string; // binding hash the approver was shown
+  p: string; // approver's number, E.164, as seen by the verified channel
+  v: 'owner_tap' | 'owner_voice' | 'assistant';
+  d: 'approved' | 'rejected';
+  i: number; // issued at, seconds
+  e: number; // expires at, seconds
+};
+
+const MAX_TOKEN_SECONDS = 600;
+
+export function signApproval(claim: ApprovalClaim, secret: string): string {
+  const payload = Buffer.from(JSON.stringify(claim), 'utf8').toString('base64url');
+  const mac = createHmac('sha256', secret).update(payload).digest('base64url');
+  return `${payload}.${mac}`;
+}
+
+export function verifyApproval(token: unknown, secret: string, nowSec: number): ApprovalClaim | null {
+  if (typeof token !== 'string' || token.length > 2000) return null;
+  const [payload, mac, extra] = token.split('.');
+  if (!payload || !mac || extra !== undefined) return null;
+  const want = createHmac('sha256', secret).update(payload).digest();
+  let got: Buffer;
+  try { got = Buffer.from(mac, 'base64url'); } catch { return null; }
+  if (got.length !== want.length || !timingSafeEqual(got, want)) return null;
+  let c: Row;
+  try { c = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); } catch { return null; }
+  if (!isObject(c)) return null;
+  if (!isUuid(c.o) || typeof c.h !== 'string' || !/^[0-9a-f]{64}$/.test(c.h)) return null;
+  if (typeof c.p !== 'string' || !/^\+[1-9][0-9]{7,14}$/.test(c.p)) return null;
+  if (!oneOf(c.v, ['owner_tap', 'owner_voice', 'assistant'] as const)) return null;
+  if (!oneOf(c.d, ['approved', 'rejected'] as const)) return null;
+  if (typeof c.i !== 'number' || typeof c.e !== 'number') return null;
+  if (c.e < nowSec || c.i > nowSec + 30 || c.e - c.i > MAX_TOKEN_SECONDS) return null;
+  return c as unknown as ApprovalClaim;
+}
+
 type Approver = { role: string; audiences: string[]; max_tier: number; may_invoice: boolean; name: string };
 
 /** The sender's number → an active approver, or null. A stranger, technician or customer has no row. */
 async function findApprover(supabase: SupabaseClient, phone: string): Promise<Approver | null> {
   const contact = await supabase
     .from('contacts')
-    .select('id, display_name, active')
+    .select('id, display_name, active, role')
     .eq('phone_e164', phone)
     .maybeSingle();
   if (!contact.data || contact.data.active === false) return null;
@@ -457,6 +590,9 @@ async function findApprover(supabase: SupabaseClient, phone: string): Promise<Ap
     .eq('contact_id', contact.data.id)
     .maybeSingle();
   if (!row.data || row.data.active === false) return null;
+  // The approver's role must match who the contact is (0082 enforces it in the database too).
+  const expected = row.data.role === 'owner' ? 'owner' : 'staff';
+  if (contact.data.role !== expected) return null;
   return {
     role: String(row.data.role),
     audiences: (row.data.audiences as string[] | null) ?? [],
@@ -466,39 +602,52 @@ async function findApprover(supabase: SupabaseClient, phone: string): Promise<Ap
   };
 }
 
+const isInvoiceRow = (o: { kind: string; attachment?: unknown }) =>
+  /invoice|factuur/i.test(o.kind) || (isObject(o.attachment) && o.attachment.type === 'invoice_pdf');
+
 /** What this approver may release. An owner may release everything; an assistant only what was granted. */
-function mayRelease(a: Approver, o: { audience: string; tier: number; kind: string }): string | null {
+function mayRelease(a: Approver, o: { audience: string; tier: number; kind: string; attachment?: unknown }): string | null {
   if (a.role === 'owner') return null;
-  if (o.kind.startsWith('invoice:') && !a.may_invoice) return 'invoice';
+  if (isInvoiceRow(o) && !a.may_invoice) return 'invoice';
   if (o.tier > a.max_tier) return 'tier';
   if (!a.audiences.includes(o.audience)) return 'audience';
   return null;
 }
 
 /**
- * POST: a person releases (or refuses) one exact text. The sender's number must
- * belong to an active approver with the right for this kind of message, the
- * hash they saw must equal the stored one (an edit cancels the release), and
- * the item must not be older than the approval window. In shadow this only
- * moves proposed → approved; nothing is sent. A refusal is logged as an event
- * naming the reason, never the number.
+ * POST: a person releases (or refuses) one exact row. The body carries only the
+ * signed token; the approver's number, channel, decision and hash are read from
+ * the token, never from the JSON around it. Then: the number must belong to an
+ * active approver with the right for this kind of message; the row must still
+ * hash to what the approver was shown (text, recipient, audience, tier, kind
+ * and attachment); and it must not be older than the approval window. The
+ * approval row and the outbox change are one database transaction. In shadow
+ * this only moves proposed → approved; nothing is sent. Refusals are logged by
+ * reason, never with the number. Fails closed with no secret configured.
  */
-export async function decideApproval(supabase: SupabaseClient, raw: unknown): Promise<Result> {
+export async function decideApproval(
+  supabase: SupabaseClient,
+  raw: unknown,
+  secret: string | undefined = process.env.JOBROOM_APPROVAL_SECRET,
+  nowSec: number = Math.floor(Date.now() / 1000)
+): Promise<Result> {
+  if (!secret || secret.length < 32) return bad('Niet beschikbaar', 503);
   if (!isObject(raw)) return bad('Ongeldige invoer');
-  if (!isUuid(raw.outboxId)) return bad('Ongeldig bericht');
-  const decision = oneOf(raw.decision, ['approved', 'rejected'] as const);
-  const via = oneOf(raw.via, ['owner_tap', 'owner_voice', 'assistant', 'system'] as const);
-  const seenHash = typeof raw.textHash === 'string' ? raw.textHash : '';
-  const phone = toE164NL(typeof raw.approverPhone === 'string' ? raw.approverPhone : null);
-  if (!decision || !via || !phone || !/^[0-9a-f]{64}$/.test(seenHash)) return bad('Ongeldige beslissing');
+  const claim = verifyApproval(raw.token, secret, nowSec);
+  if (!claim) return bad('Ongeldig goedkeuringstoken', 403, { reason: 'bad_token' });
+  if (raw.outboxId !== undefined && raw.outboxId !== claim.o) return bad('Token hoort niet bij dit bericht', 403, { reason: 'bad_token' });
+  const { o: outboxId, h: seenHash, p: phone, v: via, d: decision } = claim;
 
   const found = await supabase
     .from('job_outbox')
-    .select('id, job_room_id, contact_id, state, text_hash, audience, tier, kind, created_at')
-    .eq('id', raw.outboxId)
+    .select('id, job_room_id, contact_id, state, text_hash, audience, tier, kind, body, created_at')
+    .eq('id', outboxId)
     .maybeSingle();
   if (found.error) return bad('Ophalen mislukt', 500);
   if (!found.data) return bad('Bericht niet gevonden', 404);
+  // Written only after migration 0079; a missing column just means no attachment.
+  const att = await supabase.from('job_outbox').select('attachment').eq('id', outboxId).maybeSingle();
+  const attachment = att.error ? null : (att.data?.attachment ?? null);
 
   const refuse = async (reason: string, status: number, error: string) => {
     await supabase.from('job_events').insert({
@@ -516,11 +665,8 @@ export async function decideApproval(supabase: SupabaseClient, raw: unknown): Pr
   const approver = await findApprover(supabase, phone);
   if (!approver) return refuse('not_approver', 403, 'Geen goedkeuringsrecht');
   // The channel must match the person: an assistant only through the assistant path, an owner never through it.
-  if ((approver.role === 'assistant') !== (via === 'assistant') && via !== 'system') {
-    return refuse('wrong_channel', 403, 'Verkeerd kanaal');
-  }
-  if (via === 'system') return refuse('system_not_allowed', 403, 'Geen goedkeuringsrecht');
-  const lacking = mayRelease(approver, found.data as { audience: string; tier: number; kind: string });
+  if ((approver.role === 'assistant') !== (via === 'assistant')) return refuse('wrong_channel', 403, 'Verkeerd kanaal');
+  const lacking = mayRelease(approver, { ...(found.data as { audience: string; tier: number; kind: string }), attachment });
   if (lacking) return refuse(`not_allowed_${lacking}`, 403, 'Geen recht voor dit bericht');
 
   if (found.data.state !== 'proposed') return bad('Bericht is al behandeld', 409, { state: found.data.state });
@@ -529,36 +675,27 @@ export async function decideApproval(supabase: SupabaseClient, raw: unknown): Pr
     await supabase.from('job_outbox').update({ state: 'cancelled', last_error: 'verlopen' }).eq('id', found.data.id).eq('state', 'proposed');
     return refuse('expired', 410, 'Bericht is verlopen');
   }
-  if (found.data.text_hash !== seenHash) return bad('Tekst is gewijzigd', 409);
+  // The row must still be what its hash says, and what the approver was shown.
+  const now = outboxBindingHash({ ...(found.data as Row as Parameters<typeof outboxBindingHash>[0]), attachment });
+  if (now !== found.data.text_hash) return refuse('row_changed', 409, 'Bericht is gewijzigd');
+  if (seenHash !== found.data.text_hash) return refuse('hash_mismatch', 409, 'Tekst is gewijzigd');
 
-  const ins = await supabase
-    .from('job_approvals')
-    .insert({
-      outbox_id: found.data.id,
-      job_room_id: found.data.job_room_id,
-      decision,
-      text_hash: seenHash,
-      decided_by: approver.name,
-      decided_via: via,
-    })
-    .select('id, code')
-    .single();
-  if (ins.error?.code === '23505') return bad('Bericht is al behandeld', 409);
-  if (ins.error || !ins.data) return bad('Opslaan mislukt', 500);
-
-  const next =
-    decision === 'approved'
-      ? { state: 'approved', approved_by: approver.name, approved_at: new Date().toISOString() }
-      : { state: 'cancelled' };
-  const upd = await supabase
-    .from('job_outbox')
-    .update(next)
-    .eq('id', found.data.id)
-    .eq('state', 'proposed')
-    .select('id');
-  if (upd.error || !upd.data?.length) return bad('Bijwerken mislukt', 409);
-
-  return ok({ approvalCode: `A${ins.data.code}`, state: next.state, by: approver.role, shadow: true }, 201);
+  const done = await supabase.rpc('job_decide_approval', {
+    p_outbox_id: found.data.id,
+    p_decision: decision,
+    p_text_hash: seenHash,
+    p_decided_by: approver.name,
+    p_decided_via: via,
+  });
+  if (done.error) {
+    const m = String(done.error.message);
+    if (m.includes('already_decided') || m.includes('hash_changed')) return bad('Bericht is al behandeld', 409);
+    if (m.includes('not_found')) return bad('Bericht niet gevonden', 404);
+    return bad('Opslaan mislukt', 500);
+  }
+  const result = (Array.isArray(done.data) ? done.data[0] : done.data) as { code: number; new_state: string } | undefined;
+  if (!result) return bad('Opslaan mislukt', 500);
+  return ok({ approvalCode: `A${result.code}`, state: result.new_state, by: approver.role, shadow: true }, 201);
 }
 
 /**
@@ -628,23 +765,26 @@ export async function checkHeartbeats(
   const beats = heartbeatStatus((rows.data ?? []) as never, opts.expected, now);
 
   const alerted: string[] = [];
+  const failed: string[] = [];
   const canAlert = opts.alert && opts.alertsOn && !!opts.notify;
   for (const b of beats.filter((x) => x.stale)) {
     if (!canAlert) continue;
-    const row = (rows.data ?? []).find((r: Row) => r.service === b.service);
-    const last = row?.alerted_at ? Date.parse(String(row.alerted_at)) : 0;
-    if (now.getTime() - last < ALERT_REPEAT_MINUTES * 60_000) continue;
+    // Claim first, atomically: of two overlapping checks only one gets true.
+    const claim = await supabase.rpc('job_heartbeat_claim_alert', { p_service: b.service, p_minutes: ALERT_REPEAT_MINUTES });
+    if (claim.error || claim.data !== true) continue;
     const since = b.ageMinutes === null ? 'nog nooit' : `al ${b.ageMinutes} minuten niet`;
-    await opts.notify!(`Waarschuwing: ${b.service} heeft ${since} een teken van leven gegeven.`);
-    const stamp = now.toISOString();
-    if (row) await supabase.from('job_heartbeats').update({ alerted_at: stamp }).eq('service', b.service);
-    else await supabase.from('job_heartbeats').insert({ service: b.service, beat_at: '1970-01-01T00:00:00Z', alerted_at: stamp });
-    alerted.push(b.service);
+    try {
+      await opts.notify!(`Waarschuwing: ${b.service} heeft ${since} een teken van leven gegeven.`);
+      alerted.push(b.service);
+    } catch {
+      failed.push(b.service);
+    }
   }
   return ok({
     services: beats,
     stale: beats.filter((b) => b.stale).map((b) => b.service),
     alerted,
+    failed,
     alertsOn: opts.alertsOn,
   });
 }
@@ -784,14 +924,23 @@ export async function recordInbound(supabase: SupabaseClient, raw: unknown): Pro
 
 const INVOICE_NUMBER = /^I-\d{5}$/;
 const euro = (n: number) => n.toFixed(2).replace('.', ',');
+/** Statuses an invoice may be sent in. Anything else (paid, written off, an unknown new one) is refused. */
+const SENDABLE = ['concept', 'verzonden', 'overdue', 'partially_paid'];
 
 type Snapshot = { invoiceNumber: string; status: string; total: number; jobId: string | null; hash: string };
 
-/** The invoice as it stands now: number, total and lines, hashed. Any later edit changes the hash. */
-async function invoiceSnapshot(supabase: SupabaseClient, invoiceNumber: string): Promise<Snapshot | Result> {
+/**
+ * The invoice as it stands now, hashed: number, dates, client name and address,
+ * totals, lines and the Moneybird id. Any later edit changes the hash.
+ */
+async function invoiceSnapshot(
+  supabase: SupabaseClient,
+  invoiceNumber: string,
+  moneybirdId: string | null
+): Promise<Snapshot | Result> {
   const inv = await supabase
     .from('sales_invoices')
-    .select('id, invoice_number, status, total, subtotal, vat_total, credit_applied, job_id')
+    .select('id, invoice_number, status, issue_date, client_name, client_street, client_postcode, client_city, total, subtotal, vat_total, credit_applied, job_id')
     .eq('invoice_number', invoiceNumber)
     .maybeSingle();
   if (inv.error) return bad('Ophalen mislukt', 500);
@@ -805,30 +954,25 @@ async function invoiceSnapshot(supabase: SupabaseClient, invoiceNumber: string):
   if (lines.error) return bad('Ophalen mislukt', 500);
 
   const total = Number(inv.data.total) || 0;
+  const d = inv.data;
   const hash = sha256(
-    JSON.stringify([
-      inv.data.invoice_number, total, Number(inv.data.subtotal), Number(inv.data.vat_total),
-      Number(inv.data.credit_applied), lines.data ?? [],
+    canonical([
+      d.invoice_number, d.issue_date, d.client_name, d.client_street, d.client_postcode, d.client_city,
+      total, Number(d.subtotal), Number(d.vat_total), Number(d.credit_applied), lines.data ?? [], moneybirdId,
     ])
   );
-  return {
-    invoiceNumber: inv.data.invoice_number as string,
-    status: String(inv.data.status),
-    total,
-    jobId: (inv.data.job_id as string | null) ?? null,
-    hash,
-  };
+  return { invoiceNumber: d.invoice_number as string, status: String(d.status), total, jobId: (d.job_id as string | null) ?? null, hash };
 }
 
 const isSnapshot = (v: Snapshot | Result): v is Snapshot => 'hash' in v;
 
 /**
  * POST: propose sending one invoice to the customer of a job room. It goes
- * through the outbox as a tier 2 row (a person approves it, `ja A7`), never
- * straight to the customer. The text is fixed code, not model output. The
- * invoice must belong to this job, have lines and a total, be unpaid, and the
- * recipient must be the job's customer. Nothing is sent and Moneybird is not
- * called; Moneybird contacts are never touched from here.
+ * through the outbox as a tier 2 row (a person approves it), never straight to
+ * the customer, and only this function may set the invoice tier and attachment.
+ * The text is fixed code, not model output. The invoice must belong to this
+ * job, have lines and a total, and be in a sendable status; the recipient must
+ * be the job's customer. Nothing is sent and Moneybird is not called.
  */
 export async function proposeInvoice(supabase: SupabaseClient, raw: unknown): Promise<Result> {
   if (!isObject(raw)) return bad('Ongeldige invoer');
@@ -855,9 +999,9 @@ export async function proposeInvoice(supabase: SupabaseClient, raw: unknown): Pr
   if (contact.error) return bad('Ophalen mislukt', 500);
   if (!contact.data || contact.data.role !== 'customer') return bad('Ontvanger is geen klant', 409);
 
-  const snap = await invoiceSnapshot(supabase, number);
+  const snap = await invoiceSnapshot(supabase, number, mb);
   if (!isSnapshot(snap)) return snap;
-  if (['betaald', 'written_off'].includes(snap.status)) return bad('Factuur is al afgehandeld', 409, { status: snap.status });
+  if (!SENDABLE.includes(snap.status)) return bad('Factuur kan niet verstuurd worden', 409, { status: snap.status });
   if (!(snap.total > 0)) return bad('Factuur heeft geen bedrag', 409);
   if (!room.data.job_id || snap.jobId !== room.data.job_id) return bad('Factuur hoort niet bij deze klus', 409);
 
@@ -865,9 +1009,9 @@ export async function proposeInvoice(supabase: SupabaseClient, raw: unknown): Pr
   const greeting = /^klant \d{4}$/i.test(name) ? 'Beste klant' : `Beste ${name}`;
   const body = `${greeting}, hierbij de factuur ${snap.invoiceNumber} van Autosleutel24, totaal € ${euro(snap.total)}. Betalen kan binnen 14 dagen. Bedankt!`;
 
-  const proposed = await proposeOutbox(supabase, {
-    jobRoomId: room.data.id,
-    contactId: contact.data.id,
+  return insertOutbox(supabase, {
+    jobRoomId: room.data.id as string,
+    contactId: contact.data.id as string,
     audience: 'self_started',
     kind: `invoice:${snap.invoiceNumber}:${snap.hash.slice(0, 12)}`,
     tier: 2,
@@ -880,15 +1024,13 @@ export async function proposeInvoice(supabase: SupabaseClient, raw: unknown): Pr
       ...(mb ? { moneybirdInvoiceId: mb } : {}),
     },
   });
-  return proposed.status === 201 || proposed.status === 200
-    ? { status: proposed.status, body: { ...proposed.body, invoiceNumber: snap.invoiceNumber, textHash: sha256(body), body } }
-    : proposed;
 }
 
 /**
- * GET: is the invoice behind this outbox row still the one that was approved?
- * The transport asks this right before attaching it; `unchanged: false` means
- * propose again and get a new approval.
+ * GET: is the invoice behind this outbox row still the one that was approved,
+ * and is the row still waiting to go out? The transport asks this right before
+ * it attaches the invoice; `unchanged: false` means propose again and get a new
+ * approval.
  */
 export async function verifyInvoice(supabase: SupabaseClient, outboxId: string | null): Promise<Result> {
   if (!isUuid(outboxId)) return bad('Ongeldig bericht');
@@ -897,8 +1039,9 @@ export async function verifyInvoice(supabase: SupabaseClient, outboxId: string |
   const att = row.data?.attachment as Row | null | undefined;
   if (!row.data || !att || att.type !== 'invoice_pdf') return bad('Geen factuurbericht', 404);
 
-  const snap = await invoiceSnapshot(supabase, String(att.invoiceNumber));
+  const snap = await invoiceSnapshot(supabase, String(att.invoiceNumber), (att.moneybirdInvoiceId as string | undefined) ?? null);
   if (!isSnapshot(snap)) return snap;
-  const unchanged = snap.hash === att.snapshotHash && !['betaald', 'written_off'].includes(snap.status);
+  const waiting = ['proposed', 'approved'].includes(String(row.data.state));
+  const unchanged = waiting && snap.hash === att.snapshotHash && SENDABLE.includes(snap.status);
   return ok({ unchanged, state: row.data.state, invoiceNumber: snap.invoiceNumber, status: snap.status });
 }

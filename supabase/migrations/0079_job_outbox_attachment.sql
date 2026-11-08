@@ -10,4 +10,4 @@
 
 alter table public.job_outbox
   add column if not exists attachment jsonb
-  check (attachment is null or pg_column_size(attachment) <= 2000);
+  check (attachment is null or octet_length(attachment::text) <= 2000);
