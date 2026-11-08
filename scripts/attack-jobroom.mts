@@ -11,10 +11,11 @@ import { randomUUID } from 'node:crypto';
 import { fakeDb, type Row } from './lib/fakeJobDb.mts';
 import * as J from '../src/lib/opsJobRoom.ts';
 import { guardText, maskSensitive } from '../src/lib/jobRoomGuard.ts';
+import { DESKS } from '../src/lib/jobRoomLive.ts';
 
 const {
   openJobRoom, recordEvent, recordInbound, proposeOutbox, decideApproval, saveContact, addParty,
-  checkHeartbeats, recordHeartbeat, signApproval, outboxBindingHash,
+  checkHeartbeats, recordHeartbeat, signApproval, outboxBindingHash, mintOwnerApproval, TIER0_TEMPLATES, verifyApproval,
 } = J;
 
 let cases = 0;
@@ -95,8 +96,10 @@ async function world(jitter = false) {
   const customer = await mk('0600000011', 'Klant Test', 'customer');
   const tech = await mk('0600000012', 'Monteur Test', 'technician');
   const otherTech = await mk('0600000013', 'Andere Monteur', 'technician');
-  const ownerC = await mk('0600000099', 'Eigenaar Test', 'owner');
-  const asstC = await mk('0600000098', 'Assistent Test', 'staff');
+  // owner and staff exist only through SQL (the API refuses them): write the rows the way SQL would
+  const ownerC = randomUUID(); const asstC = randomUUID();
+  rows('contacts').push({ id: ownerC, phone_e164: '+31600000099', display_name: 'Eigenaar Test', role: 'owner', active: true });
+  rows('contacts').push({ id: asstC, phone_e164: '+31600000098', display_name: 'Assistent Test', role: 'staff', active: true });
   const room = (await openJobRoom(db, { leadId: randomUUID(), customer: { phone: '0600000011', name: 'Klant Test' } })).body.jobRoomId as string;
   await addParty(db, { jobRoomId: room, contactId: tech, role: 'technician' });
   const owner = { id: randomUUID(), contact_id: ownerC, role: 'owner', audiences: [], max_tier: 0, may_invoice: false, active: true };
@@ -151,7 +154,9 @@ await expect('attachment from the generic route is refused', async () => {
 await expect('tier 0 only for fixed kinds', async () => {
   assert.equal((await W.propose('Een bericht', { tier: 0 })).status, 422);
   assert.equal((await W.propose('Een bericht', { tier: 0, kind: 'Ack' })).status, 400);
-  assert.equal((await W.propose('Wij hebben uw bericht.', { tier: 0, kind: 'ack' })).status, 201);
+  assert.equal((await W.propose('Wij hebben uw bericht.', { tier: 0, kind: 'ack' })).status, 422, 'caller text refused');
+  assert.equal((await W.propose('Pay now at http://evil.tk, IBAN NL91ABNA0417164300', { tier: 0, kind: 'ack' })).status, 422);
+  assert.equal((await proposeOutbox(W.db, { jobRoomId: W.room, contactId: W.customer, tier: 0, kind: 'ack' })).status, 201, 'the server template');
 });
 await expect('tier / shadow / state spoofing in the body is ignored', async () => {
   const r = await W.propose('Spoof poging', { tier: 2, shadow: false, state: 'sent', approved_by: 'x' });
@@ -475,6 +480,181 @@ await expect('20 parallel heartbeat checks on a silent service: one alert', asyn
 await expect('a heartbeat clears the alert so the next silence alerts again', async () => {
   await recordHeartbeat(S.db, { service: 'transport' });
   assert.equal(S.rows('job_heartbeats')[0].alerted_at, null);
+});
+
+
+// ---------------------------------------------------------------------------
+// I. Second review
+// ---------------------------------------------------------------------------
+
+// 3. Plates: all 14 Dutch sidecodes (RDW series 1 to 14), typed by hand here, not taken from the code's list
+const SIDECODES: Array<[number, string, string]> = [
+  [1, 'XX-99-99', 'GB-12-34'], [2, '99-99-XX', '12-34-GB'], [3, '99-XX-99', '12-GB-34'], [4, 'XX-99-XX', 'AB-12-CD'],
+  [5, 'XX-XX-99', 'AB-CD-12'], [6, '99-XX-XX', '12-AB-CD'], [7, '99-XXX-9', '12-ABC-3'], [8, '9-XXX-99', '1-ABC-23'],
+  [9, 'XX-999-X', 'AB-123-C'], [10, 'X-999-XX', 'A-123-BC'], [11, 'XXX-99-X', 'ABC-12-D'], [12, 'X-99-XXX', 'A-12-BCD'],
+  [13, '9-XX-999', '1-AB-234'], [14, '999-XX-9', '123-AB-4'],
+];
+for (const [n, fmt, plate] of SIDECODES) {
+  const forms: Array<[string, string]> = [
+    ['hyphenated', plate], ['lower', plate.toLowerCase()], ['no hyphens', plate.replace(/-/g, '')], ['no hyphens lower', plate.replace(/-/g, '').toLowerCase()],
+    ['spaced', plate.replace(/-/g, ' ')], ['spaced lower', plate.replace(/-/g, ' ').toLowerCase()], ['dots', plate.replace(/-/g, '.')],
+    ['underscores', plate.replace(/-/g, '_')], ['nb-hyphen', plate.replace(/-/g, '‑')], ['en-dash', plate.replace(/-/g, '–')],
+    ['zero-width', plate.replace(/-/g, '-​')], ['in a sentence', `Het kenteken ${plate.toLowerCase()} staat bij de garage`],
+  ];
+  for (const [how, text] of forms) {
+    await expect(`sidecode ${n} (${fmt}) ${how}: ${JSON.stringify(text)}`, () => assert.equal(guardText(text, 'technician'), 'plate'));
+  }
+}
+
+// 1. IBAN, URL and payment demands
+const IBANS = ['NL91ABNA0417164300', 'NL91 ABNA 0417 1643 00', 'nl91abna0417164300', 'NL91-ABNA-0417-1643-00', 'NL91.ABNA.0417.1643.00', 'DE89370400440532013000', 'DE89 3704 0044 0532 0130 00', 'BE68539007547034', 'GB82WEST12345698765432', 'NL91AB​NA0417164300', 'ＮＬ９１ＡＢＮＡ０４１７１６４３００', 'mijn iban volgt zo', 'Maak over naar IBAN'];
+for (const t of IBANS) await expect(`IBAN ${t}`, () => assert.equal(guardText(`Rekening: ${t}`, 'customer_reply'), 'iban'));
+const URLS = ['http://evil.tk', 'https://evil.com/pay?x=1', 'www.evil.nl', 'evil.tk', 'bit.ly/abc', 'evil punt tk', 'evil (dot) com', 'evil[.]com', 'evil [dot] nl', 'HTTP://EVIL.TK', 'hxxp://evil.tk', '//evil.tk/x', 'ftp://evil.tk'];
+for (const t of URLS) await expect(`URL ${t}`, () => assert.notEqual(guardText(`Klik hier: ${t}`, 'customer_reply'), null));
+const PAYMENTS = ['Betaal nu 50 euro', 'U moet betalen via tikkie', 'pay now', 'Please pay at the door via payconiq', 'Stuur bitcoin', 'koop een gift card', 'Western Union', 'Ihre Zahlung ist fällig', 'Bitte überweisen Sie', 'ödeme yapın', 'havale yapın', 'Betaallink volgt', 'Ons rekeningnummer is'];
+for (const t of PAYMENTS) await expect(`payment ${t}`, () => assert.equal(guardText(t, 'customer_reply'), 'payment'));
+await expect('the evil tier-0 body from the review is refused', () => {
+  assert.notEqual(guardText('Pay now at http://evil.tk, IBAN NL91ABNA0417164300', 'customer_reply'), null);
+});
+await expect('internal text still cannot carry a link, payment demand or secret', () => {
+  assert.notEqual(guardText('Klik http://evil.tk', 'internal'), null);
+  assert.equal(guardText('Betaal nu', 'internal'), 'payment');
+  assert.equal(guardText('Bel 0612345678', 'internal'), null);
+});
+await expect('every tier-0 template passes the full guard', () => {
+  for (const [kind, text] of Object.entries(TIER0_TEMPLATES)) assert.equal(guardText(text, 'customer_reply'), null, kind);
+});
+await expect('tier 0 sends only the template, for customers only', async () => {
+  for (const kind of Object.keys(TIER0_TEMPLATES)) {
+    const r = await proposeOutbox(W.db, { jobRoomId: W.room, contactId: W.customer, tier: 0, kind });
+    assert.ok(r.status === 201 || r.body.duplicate === true, kind);
+    assert.equal(W.rows('job_outbox').find((o) => o.id === r.body.outboxId)!.body, TIER0_TEMPLATES[kind]);
+  }
+  const evil = 'Pay now at http://evil.tk, IBAN NL91ABNA0417164300';
+  assert.equal((await proposeOutbox(W.db, { jobRoomId: W.room, contactId: W.customer, tier: 0, kind: 'ack', body: evil })).status, 422);
+  assert.equal((await proposeOutbox(W.db, { jobRoomId: W.room, contactId: W.tech, tier: 0, kind: 'ack' })).status, 422, 'not to technicians');
+  assert.equal((await proposeOutbox(W.db, { jobRoomId: W.room, contactId: W.customer, tier: 0, kind: 'free_text', body: evil })).status, 422);
+});
+
+// 2. Roles: owner and staff are never created through the API
+await expect('the API refuses owner and staff roles', async () => {
+  for (const role of ['owner', 'staff']) assert.equal((await saveContact(W.db, { phone: '0600000031', name: 'Nep', role })).status, 403);
+  assert.equal(W.rows('contacts').some((c) => c.phone_e164 === '+31600000031'), false);
+});
+await expect('saving a known number again never changes its role', async () => {
+  await saveContact(W.db, { phone: '0600000012', name: 'Monteur Test', role: 'customer' });
+  assert.equal(W.rows('contacts').find((c) => c.phone_e164 === '+31600000012')!.role, 'technician');
+  await saveContact(W.db, { phone: '0600000099', name: 'Eigenaar Test', role: 'customer' });
+  assert.equal(W.rows('contacts').find((c) => c.phone_e164 === '+31600000099')!.role, 'owner');
+});
+await expect('a staff contact without an approver row cannot become a party or get internal text', async () => {
+  const id = randomUUID();
+  W.rows('contacts').push({ id, phone_e164: '+31600000032', display_name: 'Staff zonder recht', role: 'staff', active: true });
+  assert.equal((await addParty(W.db, { jobRoomId: W.room, contactId: id, role: 'assistant' })).status, 403);
+  W.rows('job_parties').push({ id: randomUUID(), job_room_id: W.room, contact_id: id, role: 'assistant' }); // even if a row got in
+  assert.equal((await W.propose('Klant belt: 0612345678', { contactId: id })).status, 403);
+  W.rows('job_approvers').push({ id: randomUUID(), contact_id: id, role: 'owner', audiences: [], max_tier: 0, may_invoice: false, active: true }); // role mismatch
+  assert.equal((await W.propose('Klant belt: 0612345678', { contactId: id })).status, 403, 'approver row of the wrong kind does not count');
+});
+await expect('an inactive approver gets no internal text', async () => {
+  W.asst.active = false;
+  assert.equal((await addParty(W.db, { jobRoomId: W.room, contactId: W.asstC, role: 'assistant' })).status, 403);
+  assert.equal((await W.propose('Klant belt: 0612345678', { contactId: W.asstC })).status, 403);
+  W.asst.active = true;
+});
+
+// 7. Dedupe key and derived audience
+await expect('the same text with another tier is another row (the first proposer cannot set the tier for everyone)', async () => {
+  const a = await W.propose('Dezelfde tekst, andere tier', { tier: 1 });
+  const b = await W.propose('Dezelfde tekst, andere tier', { tier: 2 });
+  assert.equal(a.status, 201);
+  assert.equal(b.status, 201);
+  assert.notEqual(a.body.outboxId, b.body.outboxId);
+  assert.equal((await W.propose('Dezelfde tekst, andere tier', { tier: 2 })).body.duplicate, true);
+});
+await expect('the audience comes from the job, not from the caller: customer_reply only after the customer wrote first', async () => {
+  const w = await world();
+  const aud = (r: Row) => w.rows('job_outbox').find((o) => o.id === r.body.outboxId)!.audience;
+  assert.equal(aud(await w.propose('Eerste bericht', { audience: 'customer_reply' })), 'self_started', 'the hint is ignored');
+  await recordInbound(w.db, { phone: '0600000011', providerMessageId: 'wamid.FIRST', body: 'Hallo' });
+  // the inbound event has no job room: attach one the way the transport does
+  await recordEvent(w.db, { direction: 'in', channel: 'whatsapp', actor: 'transport', kind: 'message', jobRoomId: w.room, contactId: w.customer, providerMessageId: 'wamid.SECOND', body: 'Hallo' });
+  assert.equal(aud(await w.propose('Tweede bericht', { audience: 'self_started' })), 'customer_reply');
+  // an old inbound message does not count
+  const old = await world();
+  old.rows('job_events').push({ id: randomUUID(), job_room_id: old.room, contact_id: old.customer, direction: 'in', created_at: new Date(Date.now() - 48 * 3_600_000).toISOString() });
+  assert.equal(aud2(old, await old.propose('Na twee dagen')), 'self_started');
+  function aud2(x: typeof old, r: Row) { return x.rows('job_outbox').find((o) => o.id === r.body.outboxId)!.audience; }
+});
+await expect('an assistant limited to customer_reply cannot release a self_started message by hinting', async () => {
+  const w = await world();
+  w.asst.audiences = ['customer_reply'];
+  const r = await w.propose('Nog niet geschreven door de klant', { audience: 'customer_reply' });
+  assert.equal((await w.approve(r.body.outboxId as string, r.body.textHash as string, ASST, 'assistant')).body.reason, 'not_allowed_audience');
+});
+
+// 8. Heartbeats: allow-list and a race-free upsert
+await expect('heartbeat names come from an allow-list', async () => {
+  const w = await world(true);
+  for (const service of ['evil', 'transport2', 'Transport', 'a', 'x'.repeat(41), '', 'drop table']) assert.equal((await recordHeartbeat(w.db, { service })).status, 400, service);
+  assert.equal(w.rows('job_heartbeats').length, 0);
+  for (const d of DESKS) assert.equal((await recordHeartbeat(w.db, { service: d.key })).status, 200, d.key);
+});
+await expect('50 parallel heartbeats for one service: no error, one row', async () => {
+  const w = await world(true);
+  const rs = await Promise.all(Array.from({ length: 50 }, () => recordHeartbeat(w.db, { service: 'transport' })));
+  assert.ok(rs.every((r) => r.status === 200));
+  assert.equal(w.rows('job_heartbeats').length, 1);
+});
+await expect('the approver is stored by contact id, not by a display name', async () => {
+  const w = await world();
+  const r = await w.propose('Wie keurde dit goed');
+  assert.equal((await w.approve(r.body.outboxId as string, r.body.textHash as string, OWNER, 'owner_tap')).status, 201);
+  assert.equal(w.rows('job_outbox').find((o) => o.id === r.body.outboxId)!.approved_by ?? w.rows('job_approvals').at(-1)!.decided_by, w.rows('job_approvals').at(-1)!.decided_by);
+  assert.equal(w.rows('job_approvals').at(-1)!.decided_by, w.ownerC);
+});
+
+// 4. The owner token endpoint: off by default, identity from the owner approver row
+await expect('mint: off by default, fails closed without a secret', async () => {
+  const w = await world();
+  const r = await w.propose('Mint test');
+  const raw = { outboxId: r.body.outboxId, decision: 'approved' };
+  assert.equal((await mintOwnerApproval(w.db, raw, { enabled: false, secret: SECRET })).status, 404);
+  assert.equal((await mintOwnerApproval(w.db, raw, { enabled: true, secret: undefined })).status, 503);
+  assert.equal((await mintOwnerApproval(w.db, raw, { enabled: true, secret: 'short' })).status, 503);
+});
+await expect('mint: the token is for the owner, hash comes from the stored row, and it works once', async () => {
+  const w = await world();
+  const r = await w.propose('Mint test twee');
+  const m = await mintOwnerApproval(w.db, { outboxId: r.body.outboxId, decision: 'approved', approverPhone: '0699999999', textHash: 'x'.repeat(64), via: 'assistant' }, { enabled: true, secret: SECRET });
+  assert.equal(m.status, 200);
+  const claim = verifyApproval(m.body.token, SECRET, nowSec())!;
+  assert.equal(claim.p, '+31600000099', 'owner number from the approver row, body fields ignored');
+  assert.equal(claim.v, 'owner_tap');
+  assert.equal(claim.h, r.body.textHash);
+  assert.ok(claim.e - claim.i <= 120);
+  assert.equal(verifyApproval(m.body.token, SECRET, nowSec() + 200), null, 'expires within minutes');
+  assert.equal((await decideApproval(w.db, { token: m.body.token })).status, 201);
+  assert.equal((await decideApproval(w.db, { token: m.body.token })).status, 409);
+});
+await expect('mint: refuses a changed row, a decided row, no owner, bad input; never for the assistant', async () => {
+  const w = await world();
+  const r = await w.propose('Mint test drie');
+  w.rows('job_outbox').find((o) => o.id === r.body.outboxId)!.body = 'Gewijzigd';
+  assert.equal((await mintOwnerApproval(w.db, { outboxId: r.body.outboxId, decision: 'approved' }, { enabled: true, secret: SECRET })).status, 409);
+  const r2 = await w.propose('Mint test vier');
+  await w.approve(r2.body.outboxId as string, r2.body.textHash as string, OWNER, 'owner_tap');
+  assert.equal((await mintOwnerApproval(w.db, { outboxId: r2.body.outboxId, decision: 'approved' }, { enabled: true, secret: SECRET })).status, 409);
+  const r3 = await w.propose('Mint test vijf');
+  w.owner.active = false;
+  assert.equal((await mintOwnerApproval(w.db, { outboxId: r3.body.outboxId, decision: 'approved' }, { enabled: true, secret: SECRET })).status, 409);
+  w.owner.active = true;
+  for (const bad of [{}, { outboxId: 'x' }, { outboxId: r3.body.outboxId, decision: 'maybe' }, null, 'x']) {
+    assert.ok([400, 404].includes((await mintOwnerApproval(w.db, bad, { enabled: true, secret: SECRET })).status));
+  }
+  const route = (await import('node:fs')).readFileSync('src/app/api/admin/jobroom/approval-token/route.ts', 'utf8');
+  assert.match(route, /user\.role !== 'owner'/, 'the route needs the owner session');
+  assert.match(route, /JOBROOM_MINT_ENABLED === 'on'/, 'and is off unless switched on');
 });
 
 // ---------------------------------------------------------------------------

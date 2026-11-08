@@ -1,8 +1,8 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { checkOps, logOps } from './opsAuth.ts';
-import { guardText, maskSecrets, type Audience } from './jobRoomGuard.ts';
-import { heartbeatStatus } from './jobRoomLive.ts';
+import { guardText, maskSecrets, type Audience, type Finding } from './jobRoomGuard.ts';
+import { DESKS, heartbeatStatus } from './jobRoomLive.ts';
 import { toE164NL } from './phone.ts';
 
 /**
@@ -61,9 +61,9 @@ export function foldName(name: string): string {
 
 export const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 
-/** The same message for the same job, person and kind is one row. */
-export const dedupeKey = (jobRoomId: string, contactId: string, kind: string, textHash: string) =>
-  sha256([jobRoomId, contactId, kind, textHash].join('\u001f'));
+/** The same message for the same job, person, kind, tier and audience is one row; a different tier or audience is a different row, so the first proposer cannot pick the tier for everyone. */
+export const dedupeKey = (jobRoomId: string, contactId: string, kind: string, textHash: string, tier: number, audience: string) =>
+  sha256([jobRoomId, contactId, kind, textHash, String(tier), audience].join('\u001f'));
 
 export { guardText };
 export type { Audience };
@@ -160,11 +160,15 @@ async function upsertContact(
   return { id: ins.data.id as string, created: true, role: c.role };
 }
 
+/** Roles the API may create. Owner and staff exist only through SQL (0083 also enforces it), because they unlock the `internal` audience. */
+const API_ROLES = ['customer', 'technician', 'garage'] as const;
+
 /** POST: save a contact (every customer who writes) and optionally one explicit alias. */
 export async function saveContact(supabase: SupabaseClient, raw: unknown): Promise<Result> {
   if (!isObject(raw)) return bad('Ongeldige invoer');
   const parsed = parseContact(raw);
   if (typeof parsed === 'string') return bad(parsed);
+  if (!(API_ROLES as readonly string[]).includes(parsed.role)) return bad('Rol niet toegestaan', 403);
   const saved = await upsertContact(supabase, parsed);
   if ('error' in saved) return bad('Opslaan mislukt', 500);
 
@@ -371,18 +375,24 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
 // Outbox (shadow) and approvals
 // ---------------------------------------------------------------------------
 
-const TIER0_KINDS = new Set(['intake_question', 'ack', 'review_request', 'on_my_way']);
+/**
+ * Tier 0 is sent without a person's approval, so the text is never the caller's:
+ * each kind has one fixed text on the server, and a body that differs is refused.
+ */
+export const TIER0_TEMPLATES: Record<string, string> = {
+  ack: 'Wij hebben uw bericht ontvangen. Een medewerker reageert zo snel mogelijk.',
+  on_my_way: 'De monteur is onderweg naar u.',
+  review_request: 'Bedankt voor uw vertrouwen in Autosleutel24. Wilt u ons een korte review geven? Wij sturen u daar zo meer over.',
+  intake_q_plate: 'Wat is het kenteken van uw auto, of het merk, model en bouwjaar?',
+  intake_q_location: 'Op welke locatie staat uw auto?',
+  intake_q_keys: 'Bent u alle sleutels kwijt, of heeft u nog een reservesleutel?',
+  intake_q_photo: 'Kunt u een foto van uw sleutel sturen, als u die nog heeft?',
+};
 const GENERIC_KIND = /^[a-z][a-z0-9._-]{0,79}$/;
 
-/** Who a message goes to decides which rules apply. The caller cannot choose `internal`. */
-function audienceFor(role: string, hint: unknown): Audience {
-  if (role === 'customer') return hint === 'customer_reply' ? 'customer_reply' : 'self_started';
-  if (role === 'technician' || role === 'garage') return 'technician';
-  return 'internal'; // staff and owner only
-}
-
 type OutboxInput = {
-  jobRoomId: string; contactId: string; audience: Audience; kind: string; tier: number; body: string; attachment?: Row | null;
+  jobRoomId: string; contactId: string; audience: Audience; kind: string; tier: number; body: string;
+  attachment?: Row | null; allow?: Finding[];
 };
 
 /**
@@ -392,7 +402,7 @@ type OutboxInput = {
  * event (reason only) instead of being stored.
  */
 async function insertOutbox(supabase: SupabaseClient, p: OutboxInput): Promise<Result> {
-  const refused = guardText(p.body, p.audience);
+  const refused = guardText(p.body, p.audience, p.allow ?? []);
   if (refused) {
     await supabase.from('job_events').insert({
       job_room_id: p.jobRoomId,
@@ -408,7 +418,7 @@ async function insertOutbox(supabase: SupabaseClient, p: OutboxInput): Promise<R
   }
   if (p.attachment && Buffer.byteLength(JSON.stringify(p.attachment), 'utf8') > 2000) return bad('Bijlage te groot', 422);
 
-  const key = dedupeKey(p.jobRoomId, p.contactId, p.kind, sha256(p.body));
+  const key = dedupeKey(p.jobRoomId, p.contactId, p.kind, sha256(p.body), p.tier, p.audience);
   const textHash = outboxBindingHash({
     job_room_id: p.jobRoomId, contact_id: p.contactId, audience: p.audience, tier: p.tier, kind: p.kind, body: p.body, attachment: p.attachment,
   });
@@ -448,10 +458,14 @@ async function isParty(supabase: SupabaseClient, room: Row, contactId: string): 
 }
 
 /**
- * POST: propose one message (the generic route). The audience comes from the
- * recipient's role, the recipient must belong to the job, and invoice rules
- * cannot be reached from here: no attachment, no invoice kind, and tier 0 (no
- * approval) only for the few fixed-text kinds.
+ * POST: propose one message (the generic route). Everything that decides how
+ * much a message may do is derived on the server, never taken from the caller:
+ * the audience from the recipient (a customer who wrote first in this job in the
+ * last 24 hours gets `customer_reply`, anyone else `self_started`; technicians
+ * `technician`; `internal` only for a contact with an active approver row), the
+ * recipient must belong to the job, invoice rules cannot be reached (no
+ * attachment, no invoice kind) and tier 0 (no approval) only exists as a fixed
+ * server-side template per kind.
  */
 export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Promise<Result> {
   if (!isObject(raw)) return bad('Ongeldige invoer');
@@ -459,11 +473,20 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
   if (!isUuid(raw.contactId)) return bad('Ongeldig contact');
   if (raw.attachment !== undefined && raw.attachment !== null) return bad('Bijlage niet toegestaan', 422);
   const kind = typeof raw.kind === 'string' && GENERIC_KIND.test(raw.kind) ? raw.kind : null;
-  const body = clean(raw.body, 4000);
   const tier = typeof raw.tier === 'number' && [0, 1, 2].includes(raw.tier) ? raw.tier : null;
-  if (!kind || !body || tier === null) return bad('Ongeldig bericht');
+  if (!kind || tier === null) return bad('Ongeldig bericht');
   if (/invoice|factuur/i.test(kind)) return bad('Gereserveerde soort', 422);
-  if (tier === 0 && !TIER0_KINDS.has(kind)) return bad('Tier 0 niet toegestaan voor deze soort', 422);
+
+  let body: string | null;
+  if (tier === 0) {
+    const template = TIER0_TEMPLATES[kind];
+    if (!template) return bad('Tier 0 niet toegestaan voor deze soort', 422);
+    if (raw.body !== undefined && raw.body !== null && clean(raw.body, 4000) !== template) return bad('Tier 0 heeft een vaste tekst', 422);
+    body = template;
+  } else {
+    body = clean(raw.body, 4000);
+  }
+  if (!body) return bad('Ongeldig bericht');
 
   const room = await supabase.from('job_rooms').select('id, customer_contact_id').eq('id', raw.jobRoomId).maybeSingle();
   if (room.error) return bad('Ophalen mislukt', 500);
@@ -473,14 +496,29 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
   if (!contact.data || contact.data.active === false) return bad('Contact niet gevonden', 404);
   if (!(await isParty(supabase, room.data, raw.contactId))) return bad('Contact hoort niet bij deze klus', 403);
 
-  return insertOutbox(supabase, {
-    jobRoomId: raw.jobRoomId,
-    contactId: raw.contactId,
-    audience: audienceFor(String(contact.data.role), raw.audience),
-    kind,
-    tier,
-    body,
-  });
+  const role = String(contact.data.role);
+  let audience: Audience;
+  if (role === 'customer') {
+    const inbound = await supabase
+      .from('job_events')
+      .select('id, created_at')
+      .eq('job_room_id', raw.jobRoomId)
+      .eq('contact_id', raw.contactId)
+      .eq('direction', 'in')
+      .order('created_at', { ascending: false })
+      .limit(20);
+    const wroteFirst = (inbound.data ?? []).some((e: Row) => Date.now() - Date.parse(String(e.created_at)) < 24 * 3_600_000);
+    audience = wroteFirst ? 'customer_reply' : 'self_started';
+  } else if (role === 'technician' || role === 'garage') {
+    audience = 'technician';
+  } else {
+    // staff and owner: `internal` only if they really are an active approver
+    if (!(await approverRowFor(supabase, raw.contactId, role))) return bad('Geen intern contact', 403);
+    audience = 'internal';
+  }
+  if (tier === 0 && audience !== 'customer_reply' && audience !== 'self_started') return bad('Tier 0 is alleen voor klanten', 422);
+
+  return insertOutbox(supabase, { jobRoomId: raw.jobRoomId, contactId: raw.contactId, audience, kind, tier, body });
 }
 
 /** POST: add a person to a job (a technician who is offered it, an assistant). The role must fit the contact. */
@@ -499,6 +537,10 @@ export async function addParty(supabase: SupabaseClient, raw: unknown): Promise<
   ]);
   if (!room.data || !contact.data) return bad('Niet gevonden', 404);
   if (!fits[role].includes(String(contact.data.role))) return bad('Rol past niet bij het contact', 409);
+  // Staff and owner unlock the internal audience: only people who really are approvers.
+  if ((role === 'assistant' || role === 'owner') && !(await approverRowFor(supabase, raw.contactId, String(contact.data.role)))) {
+    return bad('Geen goedkeurder', 403);
+  }
   const ins = await supabase.from('job_parties').insert({ job_room_id: raw.jobRoomId, contact_id: raw.contactId, role });
   if (ins.error && ins.error.code !== '23505') return bad('Opslaan mislukt', 500);
   return ok({ added: !ins.error }, ins.error ? 200 : 201);
@@ -576,7 +618,19 @@ export function verifyApproval(token: unknown, secret: string, nowSec: number): 
   return c as unknown as ApprovalClaim;
 }
 
-type Approver = { role: string; audiences: string[]; max_tier: number; may_invoice: boolean; name: string };
+type Approver = { role: string; audiences: string[]; max_tier: number; may_invoice: boolean; name: string; contactId: string };
+
+/** The active approver row of this contact, and only if its role matches who the contact is. */
+async function approverRowFor(supabase: SupabaseClient, contactId: string, contactRole: string): Promise<Row | null> {
+  const row = await supabase
+    .from('job_approvers')
+    .select('role, audiences, max_tier, may_invoice, active')
+    .eq('contact_id', contactId)
+    .maybeSingle();
+  if (!row.data || row.data.active === false) return null;
+  const expected = row.data.role === 'owner' ? 'owner' : 'staff';
+  return contactRole === expected ? row.data : null;
+}
 
 /** The sender's number → an active approver, or null. A stranger, technician or customer has no row. */
 async function findApprover(supabase: SupabaseClient, phone: string): Promise<Approver | null> {
@@ -586,25 +640,18 @@ async function findApprover(supabase: SupabaseClient, phone: string): Promise<Ap
     .eq('phone_e164', phone)
     .maybeSingle();
   if (!contact.data || contact.data.active === false) return null;
-  const row = await supabase
-    .from('job_approvers')
-    .select('role, audiences, max_tier, may_invoice, active')
-    .eq('contact_id', contact.data.id)
-    .maybeSingle();
-  if (!row.data || row.data.active === false) return null;
-  // The approver's role must match who the contact is (0082 enforces it in the database too).
-  const expected = row.data.role === 'owner' ? 'owner' : 'staff';
-  if (contact.data.role !== expected) return null;
+  const row = await approverRowFor(supabase, String(contact.data.id), String(contact.data.role));
+  if (!row) return null;
   return {
-    role: String(row.data.role),
-    audiences: (row.data.audiences as string[] | null) ?? [],
-    max_tier: Number(row.data.max_tier) || 0,
-    may_invoice: row.data.may_invoice === true,
+    role: String(row.role),
+    audiences: (row.audiences as string[] | null) ?? [],
+    max_tier: Number(row.max_tier) || 0,
+    may_invoice: row.may_invoice === true,
     name: String(contact.data.display_name).slice(0, 80),
+    contactId: String(contact.data.id),
   };
 }
 
-/** An invoice by its kind, its attachment, or because its text talks about one (a generic message cannot pass as "not an invoice"). */
 const isInvoiceRow = (o: { kind: string; body?: string; attachment?: unknown }) =>
   /invoice|factuur|rekening|iban/i.test(o.kind) ||
   /factuur|invoice|\biban\b|\bnl\d{2}\s?[a-z]{4}/i.test(o.body ?? '') ||
@@ -689,7 +736,7 @@ export async function decideApproval(
     p_outbox_id: found.data.id,
     p_decision: decision,
     p_text_hash: seenHash,
-    p_decided_by: approver.name,
+    p_decided_by: approver.contactId, // the person's id, not a display name that can change
     p_decided_via: via,
   });
   if (done.error) {
@@ -733,17 +780,21 @@ export async function approvalSummary(supabase: SupabaseClient, now: Date = new 
 const SERVICE = /^[a-z][a-z0-9_-]{1,39}$/;
 const ALERT_REPEAT_MINUTES = 60;
 
-/** POST: a service says it is alive. Resets any earlier alert so the next silence alerts again. */
+/** Services that must keep beating. Config: JOBROOM_HEARTBEAT_SERVICES, comma separated (default: transport). */
+export const expectedServices = (): string[] =>
+  (process.env.JOBROOM_HEARTBEAT_SERVICES ?? 'transport').split(',').map((x) => x.trim()).filter(Boolean);
+
+/** Names a service may beat under: the expected ones and the office desks. Anything else is refused. */
+const allowedServices = (): Set<string> => new Set([...expectedServices(), ...DESKS.map((d) => d.key)]);
+
+/** POST: a service says it is alive. One upsert, so two beats at once cannot race into an error. Resets any earlier alert. */
 export async function recordHeartbeat(supabase: SupabaseClient, raw: unknown): Promise<Result> {
   if (!isObject(raw)) return bad('Ongeldige invoer');
   const service = typeof raw.service === 'string' ? raw.service : '';
-  if (!SERVICE.test(service)) return bad('Ongeldige dienst');
-  const row = { beat_at: new Date().toISOString(), note: clean(raw.note, 200), alerted_at: null };
-  const existing = await supabase.from('job_heartbeats').select('service').eq('service', service).maybeSingle();
-  if (existing.error) return bad('Opslaan mislukt', 500);
-  const done = existing.data
-    ? await supabase.from('job_heartbeats').update(row).eq('service', service)
-    : await supabase.from('job_heartbeats').insert({ service, ...row });
+  if (!SERVICE.test(service) || !allowedServices().has(service)) return bad('Ongeldige dienst');
+  const done = await supabase
+    .from('job_heartbeats')
+    .upsert({ service, beat_at: new Date().toISOString(), note: clean(raw.note, 200), alerted_at: null }, { onConflict: 'service' });
   if (done.error) return bad('Opslaan mislukt', 500);
   return ok({ service, ok: true });
 }
@@ -792,6 +843,57 @@ export async function checkHeartbeats(
     failed,
     alertsOn: opts.alertsOn,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Owner approval token (off by default)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mints a short-lived approval token for the OWNER, from the owner's signed-in
+ * CRM session (the route checks the session; this function checks the rest).
+ * The server, not the caller, decides what is approved: it re-computes the hash
+ * of the stored row, and the approver's number comes from the owner's approver
+ * row. Off unless JOBROOM_MINT_ENABLED=on. Fails closed without a secret.
+ * The assistant never reaches this: it has no CRM session, and its own tokens
+ * come from the tech-listen process (see docs/jobroom-approval-secret.md).
+ */
+export async function mintOwnerApproval(
+  supabase: SupabaseClient,
+  raw: unknown,
+  cfg: { enabled: boolean; secret: string | undefined; nowSec?: number }
+): Promise<Result> {
+  if (!cfg.enabled) return bad('Niet beschikbaar', 404);
+  if (!cfg.secret || cfg.secret.length < 32) return bad('Niet beschikbaar', 503);
+  if (!isObject(raw) || !isUuid(raw.outboxId)) return bad('Ongeldig bericht');
+  const decision = oneOf(raw.decision, ['approved', 'rejected'] as const);
+  if (!decision) return bad('Ongeldige beslissing');
+
+  const row = await supabase
+    .from('job_outbox')
+    .select('id, job_room_id, contact_id, state, text_hash, audience, tier, kind, body')
+    .eq('id', raw.outboxId)
+    .maybeSingle();
+  if (row.error) return bad('Ophalen mislukt', 500);
+  if (!row.data) return bad('Bericht niet gevonden', 404);
+  if (row.data.state !== 'proposed') return bad('Bericht is al behandeld', 409);
+  const att = await supabase.from('job_outbox').select('attachment').eq('id', raw.outboxId).maybeSingle();
+  const attachment = att.error ? null : (att.data?.attachment ?? null);
+  const hash = outboxBindingHash({ ...(row.data as Row as Parameters<typeof outboxBindingHash>[0]), attachment });
+  if (hash !== row.data.text_hash) return bad('Bericht is gewijzigd', 409);
+
+  const approvers = await supabase.from('job_approvers').select('contact_id, role, active').eq('role', 'owner');
+  const owner = (approvers.data ?? []).find((a: Row) => a.active !== false);
+  if (!owner) return bad('Geen eigenaar als goedkeurder', 409);
+  const contact = await supabase.from('contacts').select('phone_e164, role').eq('id', owner.contact_id).maybeSingle();
+  if (!contact.data || contact.data.role !== 'owner') return bad('Geen eigenaar als goedkeurder', 409);
+
+  const now = cfg.nowSec ?? Math.floor(Date.now() / 1000);
+  const token = signApproval(
+    { o: row.data.id as string, h: hash, p: String(contact.data.phone_e164), v: 'owner_tap', d: decision, i: now, e: now + 120 },
+    cfg.secret
+  );
+  return ok({ token, expiresInSeconds: 120 });
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1123,7 @@ export async function proposeInvoice(supabase: SupabaseClient, raw: unknown): Pr
     kind: `invoice:${snap.invoiceNumber}:${snap.hash.slice(0, 12)}`,
     tier: 2,
     body,
+    allow: ['payment'], // the fixed invoice text says "Betalen kan binnen 14 dagen"; it has no link and no bank number
     attachment: {
       type: 'invoice_pdf',
       invoiceNumber: snap.invoiceNumber,

@@ -10,7 +10,7 @@
  */
 
 export type Audience = 'customer_reply' | 'technician' | 'self_started' | 'internal';
-export type Finding = 'secret' | 'phone' | 'email' | 'plate';
+export type Finding = 'secret' | 'iban' | 'phone' | 'email' | 'url' | 'plate' | 'payment';
 
 const ZERO_WIDTH = new RegExp('[\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\ufeff\\u00ad\\ufe0f\\u20e3\\u034f\\u180e]', 'g');
 const DASHES = new RegExp('[\\u2010-\\u2015\\u2212\\ufe58\\ufe63\\uff0d]', 'g');
@@ -109,14 +109,19 @@ function hasEmail(normalized: string): boolean {
 
 // --- licence plate -----------------------------------------------------------
 
-/** The Dutch sidecode layouts, compact (no separators): 6 characters. */
-const PLATES = [
-  /^[a-z]{2}\d{2}\d{2}$/, /^\d{2}[a-z]{2}\d{2}$/, /^\d{2}\d{2}[a-z]{2}$/,
-  /^[a-z]{2}[a-z]{2}\d{2}$/, /^\d{2}[a-z]{2}[a-z]{2}$/, /^\d[a-z]{3}\d{2}$/,
-  /^[a-z]{2}\d{3}[a-z]$/, /^[a-z]\d{3}[a-z]{2}$/, /^[a-z]{3}\d{2}[a-z]$/, /^\d[a-z]{2}\d{3}$/,
-];
-/** Group sizes of the Dutch layouts when written with separators (XX-99-99 is 222, XX-999-X is 231, 9-XXX-99 is 132 ...). */
-const GROUPINGS = new Set(['222', '231', '132', '321', '123']);
+/**
+ * The Dutch sidecodes (RDW kenteken series 1 to 14), X = letter, 9 = digit.
+ * Everything below is derived from this list, so a new series is one line.
+ */
+export const PLATE_FORMATS = [
+  'XX-99-99', '99-99-XX', '99-XX-99', 'XX-99-XX', 'XX-XX-99', '99-XX-XX', '99-XXX-9',
+  '9-XXX-99', 'XX-999-X', 'X-999-XX', 'XXX-99-X', 'X-99-XXX', '9-XX-999', '999-XX-9',
+] as const;
+const formatRegex = (f: string) =>
+  new RegExp(`^${f.replace(/-/g, '').replace(/X/g, '[a-z]').replace(/9/g, '\\d')}$`);
+const PLATES = PLATE_FORMATS.map(formatRegex);
+/** Group sizes of the layouts when written with separators: XX-99-99 is "222", X-99-XXX is "123" ... */
+const GROUPINGS = new Set(PLATE_FORMATS.map((f) => f.split('-').map((g) => g.length).join('')));
 
 /** Small words that appear between numbers in ordinary sentences ("08 om 10"); a plate window never spans one. */
 const STOP = new Set(['om', 'op', 'en', 'of', 'in', 'de', 'het', 'uur', 'tot', 'met', 'bij', 'at', 'to', 'on', 'um', 'am', 've', 'is', 'na', 'te', 'van', 'tm', 'ca']);
@@ -134,6 +139,10 @@ function hasPlate(normalized: string): boolean {
   const chunks = [...normalized.matchAll(/[a-z0-9]+/g)].map((m) => ({ text: m[0], start: m.index!, end: m.index! + m[0].length }));
   for (let i = 0; i < chunks.length; i++) {
     if (isPlate(chunks[i].text)) return true; // written without separators
+    // "AB-12CD": two chunks, hyphen only (a space would make "50 voor" look like 99-XX-XX)
+    if (i + 1 < chunks.length && normalized.slice(chunks[i].end, chunks[i + 1].start) === '-' && !STOP.has(chunks[i].text) && !STOP.has(chunks[i + 1].text)) {
+      if (isPlate(chunks[i].text + chunks[i + 1].text)) return true;
+    }
     // written as three groups: XX-99-99, 99-XX-99, XX-999-X ... separators single, groups the right size
     if (i + 2 >= chunks.length) continue;
     const win = [chunks[i], chunks[i + 1], chunks[i + 2]];
@@ -174,28 +183,71 @@ function hasSecret(original: string, normalized: string): boolean {
   return SECRET_PATTERNS.some((p) => p.test(normalized)) || hasHighEntropyToken(original.normalize('NFKC').replace(ZERO_WIDTH, ''));
 }
 
+// --- IBAN, links and payment requests ------------------------------------------
+
+/** ISO 7064 mod 97 check: an IBAN, however it is spaced. */
+function ibanValid(compact: string): boolean {
+  if (compact.length < 15 || compact.length > 34) return false;
+  const moved = compact.slice(4) + compact.slice(0, 4);
+  let rem = 0;
+  for (const ch of moved) {
+    const v = /\d/.test(ch) ? ch : String(ch.charCodeAt(0) - 87);
+    for (const d of v) rem = (rem * 10 + Number(d)) % 97;
+  }
+  return rem === 1;
+}
+
+function hasIban(normalized: string): boolean {
+  if (/(?<![a-z])iban(?![a-z])/.test(normalized)) return true;
+  return (normalized.match(/[a-z]{2}\d{2}(?:[\s.\-_]?[a-z0-9]){11,30}/g) ?? []).some((m) => {
+    const compact = m.replace(/[^a-z0-9]/g, '');
+    for (let n = Math.min(compact.length, 34); n >= 15; n--) if (ibanValid(compact.slice(0, n))) return true;
+    return false;
+  });
+}
+
+const TLD = 'com|nl|de|net|org|tk|ml|ga|cf|gq|xyz|top|info|biz|io|me|co|eu|be|app|link|click|online|site|shop|store|live|icu|ru|cn|pw|cc|ws|to|ly|gl|tr|uk|fr|es|it|pl';
+const URL_RE = new RegExp(`(?:https?:|ftp:)?//[^\\s]+|(?<![a-z0-9@.-])www\\.|(?<![a-z0-9@.-])[a-z0-9][a-z0-9-]*\\.(?:${TLD})(?![a-z0-9])`);
+
+function hasUrl(normalized: string): boolean {
+  if (URL_RE.test(normalized)) return true;
+  const spelled = normalized
+    .replace(/[([{]\s*(?:dot|punt|\.)\s*[)\]}]|(?<![a-z])(?:dot|punt)(?![a-z])/g, '.')
+    .replace(/\s*\.\s*/g, '.');
+  return URL_RE.test(spelled);
+}
+
+const PAYMENT = /betaal|betalen|overmaken|overboeken|stort |storten|tikkie|payconiq|pay now|pay at|payment|betaallink|bitcoin|crypto|gift ?card|cadeaubon|western union|wire transfer|rekeningnummer|bankrekening|bank account|zahlen|zahlung|[uü]berweis|\bode\b|[oö]deme|havale|\bpaypal\b|\bidea?l\b/;
+
 // --- verdicts ------------------------------------------------------------------
 
-/** The first rule a text breaks, or null. */
-export function findSensitive(text: string): Finding | null {
+const ORDER: Finding[] = ['secret', 'iban', 'phone', 'email', 'url', 'plate', 'payment'];
+
+/** The first rule a text breaks (among `kinds`, default all), or null. */
+export function findSensitive(text: string, kinds: readonly Finding[] = ORDER): Finding | null {
   const n = normalize(text);
-  if (hasSecret(text, n)) return 'secret';
-  if (hasPhone(n)) return 'phone';
-  if (hasEmail(n)) return 'email';
-  if (hasPlate(n)) return 'plate';
-  return null;
+  const test: Record<Finding, () => boolean> = {
+    secret: () => hasSecret(text, n),
+    iban: () => hasIban(n),
+    phone: () => hasPhone(n),
+    email: () => hasEmail(n),
+    url: () => hasUrl(n),
+    plate: () => hasPlate(n),
+    payment: () => PAYMENT.test(n),
+  };
+  return ORDER.find((k) => kinds.includes(k) && test[k]()) ?? null;
 }
 
 /**
  * At the moment a row is proposed. A key-like string is refused for everyone.
- * Contact details are refused for every audience except `internal`, which is
- * only ever derived from a staff or owner contact, never chosen by a caller.
+ * `internal` (text for an approver, never for a customer or technician) may
+ * hold contact details, but a payment link, a bank number request or a
+ * payment demand is refused there too, so it cannot be used to launder one.
+ * `allow` lets server-built texts (the invoice message) say "betalen".
  */
-export function guardText(text: string, audience: Audience): string | null {
-  const found = findSensitive(text);
-  if (found === 'secret') return 'secret';
-  if (audience === 'internal') return null;
-  return found;
+export function guardText(text: string, audience: Audience, allow: readonly Finding[] = []): string | null {
+  const kinds = (audience === 'internal' ? ['secret', 'url', 'payment'] : ORDER).filter((k) => !allow.includes(k as Finding)) as Finding[];
+  return findSensitive(text, kinds);
 }
 
 /** Shows only the last 4 digits of a phone-like run. Dates and times stay. */
@@ -203,12 +255,14 @@ export function maskPhones(text: string): string {
   return text.replace(PHONE_RUN, (m) => (digitCount(stripDates(m)) >= 9 ? `••••${m.replace(/\D/g, '').slice(-4)}` : m));
 }
 
-const REASON_NL: Record<Finding, string> = {
+const REASON_NL: Partial<Record<Finding, string>> = {
   secret: 'een sleutel',
+  iban: 'een bankrekening',
   phone: 'een telefoonnummer',
   email: 'een e-mailadres',
   plate: 'een kenteken',
 };
+const MASKED_KINDS: Finding[] = ['secret', 'iban', 'phone', 'email', 'plate'];
 
 /** Hides secrets in place, whatever the surrounding text. Used before a body is stored. */
 export function maskSecrets(text: string): string {
@@ -219,14 +273,15 @@ export function maskSecrets(text: string): string {
 }
 
 /**
- * For screens: mask what can be masked in place, and if anything sensitive is
- * still detectable afterwards (a number spelled out, an address written with
- * "punt"), hide the whole text rather than guess where it is.
+ * For screens: mask what can be masked in place, and if a secret, bank number,
+ * phone, email or plate is still detectable afterwards (a number spelled out,
+ * an address written with "punt"), hide the whole text rather than guess where.
+ * Links and payment words are not hidden on screen: they are for the approver to see.
  */
 export function maskSensitive(text: string): string {
   let out = maskSecrets(text);
   out = out.replace(new RegExp(EMAIL.source, 'gi'), '[e-mail]');
   out = maskPhones(out);
-  const left = findSensitive(out.replace(/••••\d{4}|\[sleutel\]|\[e-mail\]/g, ' '));
+  const left = findSensitive(out.replace(/••••\d{4}|\[sleutel\]|\[e-mail\]/g, ' '), MASKED_KINDS);
   return left ? `[tekst verborgen: bevat ${REASON_NL[left]}]` : out;
 }

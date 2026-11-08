@@ -32,13 +32,19 @@ export function fakeDb(opts: { jitter?: boolean } = {}) {
   const yieldNow = () => (opts.jitter ? new Promise<void>((r) => setImmediate(r)) : Promise.resolve());
 
   const from = (table: string) => {
-    let op: 'select' | 'insert' | 'update' = 'select';
+    let op: 'select' | 'insert' | 'update' | 'upsert' = 'select';
+    let conflict = '';
     let payload: Row = {};
     const filters: ((r: Row) => boolean)[] = [];
     let mode: 'many' | 'single' | 'maybe' = 'many';
     let max = Infinity;
 
     const run = () => {
+      if (op === 'upsert') {
+        const existing = rows(table).find((r) => r[conflict] === payload[conflict]);
+        if (existing) { Object.assign(existing, payload); return { data: [existing], error: null }; }
+        op = 'insert';
+      }
       if (op === 'insert') {
         const defaults: Row = table === 'contacts' ? { active: true } : {};
         const row: Row = { id: randomUUID(), created_at: new Date().toISOString(), ...defaults, ...payload };
@@ -68,6 +74,7 @@ export function fakeDb(opts: { jitter?: boolean } = {}) {
       select: () => b,
       insert: (p: Row) => ((op = 'insert'), (payload = p), b),
       update: (p: Row) => ((op = 'update'), (payload = p), b),
+      upsert: (p: Row, o: { onConflict: string }) => ((op = 'upsert'), (payload = p), (conflict = o.onConflict), b),
       eq: (c: string, v: unknown) => (filters.push((r) => r[c] === v), b),
       in: (c: string, v: unknown[]) => (filters.push((r) => v.includes(r[c])), b),
       is: (c: string, v: unknown) => (filters.push((r) => (r[c] ?? null) === v), b),

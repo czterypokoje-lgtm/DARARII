@@ -85,9 +85,15 @@ function stubDb() {
       select: () => b,
       insert: (p: Row) => ((op = 'insert'), (payload = p), b),
       update: (p: Row) => ((op = 'update'), (payload = p), b),
+      upsert: (p: Row) => ((op = 'upsert'), (payload = p), b),
       eq: (c: string, v: unknown) => (f.push((r) => r[c] === v), b),
       maybeSingle: () => ((one = true), b),
       then: (res: (v: unknown) => void) => {
+        if (op === 'upsert') {
+          const ex = t.find((r) => r.service === payload.service);
+          if (ex) Object.assign(ex, payload); else t.push({ ...payload });
+          return res({ data: null, error: null });
+        }
         if (op === 'insert') { t.push({ ...payload }); return res({ data: null, error: null }); }
         const hit = t.filter((r) => f.every((x) => x(r)));
         if (op === 'update') { hit.forEach((r) => Object.assign(r, payload)); return res({ data: null, error: null }); }

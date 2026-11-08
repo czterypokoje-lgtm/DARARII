@@ -1,15 +1,8 @@
-import { checkHeartbeats, recordHeartbeat, runOps } from '@/lib/opsJobRoom';
+import { checkHeartbeats, expectedServices, recordHeartbeat, runOps } from '@/lib/opsJobRoom';
 import { createSupabaseAdminClient } from '@/lib/supabase/admin';
 import { sendTelegram } from '@/lib/telegram';
 
 export const dynamic = 'force-dynamic';
-
-/** Services that must keep beating. Config: JOBROOM_HEARTBEAT_SERVICES, comma separated. */
-const expectedServices = () =>
-  (process.env.JOBROOM_HEARTBEAT_SERVICES ?? 'transport')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
 
 /** A service says it is alive. */
 export async function POST(request: Request) {

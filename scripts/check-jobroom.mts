@@ -117,8 +117,10 @@ assert.equal(JSON.stringify(rows('job_events').at(-1)!.meta).includes('0612'), f
 const OWNER = '0600000099';
 const ASSISTANT = '0600000098';
 const approverContact = async (phone: string, name: string, role: string) => {
-  const r = await saveContact(db, { phone, name, role: role === 'owner' ? 'owner' : 'staff' });
-  const row = { id: randomUUID(), contact_id: r.body.contactId, role, audiences: [] as string[], max_tier: 0, may_invoice: false, active: true };
+  // owner and staff exist only through SQL: the API refuses them, so the fixture writes the row itself
+  const cid = randomUUID();
+  rows('contacts').push({ id: cid, phone_e164: phone.startsWith('0') ? `+31${phone.slice(1)}` : phone, display_name: name, role: role === 'owner' ? 'owner' : 'staff', active: true });
+  const row = { id: cid + '-a', contact_id: cid, role, audiences: [] as string[], max_tier: 0, may_invoice: false, active: true };
   rows('job_approvers').push(row);
   return row;
 };
@@ -300,7 +302,7 @@ assert.equal(invOutbox.audience, 'self_started');
 assert.equal(invOutbox.attachment.type, 'invoice_pdf');
 assert.equal(invOutbox.attachment.moneybirdInvoiceId, '123456789012');
 assert.match(invOutbox.body, /I-00001.*€ 149,50/);
-assert.equal(guardText(invOutbox.body, 'customer_reply'), null);
+assert.equal(guardText(invOutbox.body, 'customer_reply', ['payment']), null, 'the invoice text passes everything but the payment-wording rule it is exempt from');
 
 iv = await proposeInvoice(db, inv({ moneybirdInvoiceId: '123456789012' }));
 assert.equal(iv.body.duplicate, true, 'the same invoice is one row');
@@ -363,7 +365,7 @@ let x = await decide(d, ASSISTANT, 'assistant');
 assert.equal(x.status, 403);
 assert.equal(x.body.reason, 'not_allowed_tier');
 // Grant: customer drafts up to tier 2, no invoices, no technicians
-asst.audiences = ['customer_reply']; asst.max_tier = 2;
+asst.audiences = ['customer_reply', 'self_started']; asst.max_tier = 2;
 x = await decide(d, ASSISTANT, 'assistant');
 assert.equal(x.status, 201, 'assistant approves a customer draft');
 assert.equal(x.body.by, 'assistant');
@@ -486,7 +488,8 @@ assert.ok(((sm.body.oldest as Row[])[0].waitingMinutes as number) >= 39);
     assert.ok(r.status === 422 || r.status === 400, `kind ${kind} refused`);
   }
   assert.equal((await proposeOutbox(db, { ...base, kind: 'note', tier: 0 })).status, 422, 'tier 0 only for fixed-text kinds');
-  assert.equal((await proposeOutbox(db, { ...base, kind: 'ack', tier: 0, body: 'Wij hebben uw bericht.' })).status, 201);
+  assert.equal((await proposeOutbox(db, { ...base, kind: 'ack', tier: 0, body: 'Wij hebben uw bericht.' })).status, 422, 'tier 0 text is the server template, not the caller\'s');
+  assert.equal((await proposeOutbox(db, { ...base, body: undefined, kind: 'ack', tier: 0 })).status, 201);
   // A row whose KIND looks harmless but whose attachment is an invoice still needs may_invoice
   const sneaky = { ...invRow, id: randomUUID(), kind: 'Rekening', dedupe_key: 'y'.repeat(64), body: 'Rekening', state: 'proposed', created_at: new Date().toISOString() } as Row;
   sneaky.text_hash = outboxBindingHash(sneaky as never);
