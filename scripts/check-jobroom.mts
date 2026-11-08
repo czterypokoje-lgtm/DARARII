@@ -11,7 +11,7 @@ import * as jobRoom from '../src/lib/opsJobRoom.ts';
 
 const {
   runOps, openJobRoom, recordEvent, proposeOutbox, decideApproval, listOutbox,
-  saveContact, resolveContact, foldName, guardText, sha256,
+  saveContact, resolveContact, resolveNote, recordInbound, foldName, guardText, sha256,
 } = jobRoom;
 
 process.env.OPS_API_TOKEN = 'x'.repeat(40);
@@ -224,6 +224,106 @@ assert.equal((r.body.candidates as Row[]).length, 2);
 assert.equal(JSON.stringify(r.body).includes('+31'), false, 'only the last 4 digits come back');
 assert.equal((await saveContact(db, { phone: '0655555555', name: 'Zed', alias: 'Z' })).status, 400, 'an alias needs a confirmer');
 
+// --- S3: resolver cases (the "30 cases" done rule), shadow ---
+let cases = 0;
+const tech = (phone: string, name: string, alias: string, city: string) =>
+  saveContact(db, { phone, name, role: 'technician', city, alias, confirmedBy: 'owner' });
+await tech('0655550001', 'Mehmet Y', 'Mehmet', 'Den Haag');
+await tech('0655555883', 'Sikor P', 'Sikor', 'Utrecht');
+await tech('0655550003', 'Halil T', 'Halil', 'Breda');
+await saveContact(db, { phone: '0655550004', name: 'Ali Klant', role: 'customer' });
+
+const one = async (q: string, name: string, opts = {}) => {
+  const r = await resolveContact(db, q, opts);
+  assert.equal(r.body.status, 'one', `${q} -> one`);
+  assert.equal((r.body.contact as Row).name, name, `${q} -> ${name}`);
+  cases++;
+};
+const status = async (q: string | null, want: string | number, opts = {}) => {
+  const r = await resolveContact(db, q, opts);
+  assert.equal(r.body.status ?? r.status, want, `${q} -> ${want}`);
+  cases++;
+};
+await one('Ali', 'Ali D');
+await one('ali', 'Ali D');
+await one('ALİ', 'Ali D');
+await one('Alihan', 'Alihan K');
+await one('Ali D', 'Ali D');
+await one('Halil', 'Halil T');
+await one('Ali', 'Ali D'); // Halil exists now, Ali still does not hit it
+await status('Alih', 'none'); // a prefix is never a match
+await status('Hali', 'none');
+await status('Oguz', 'ambiguous');
+await status('Oğuz', 'ambiguous');
+await status('OĞUZ', 'ambiguous');
+await one('Oğuz A', 'Oğuz A');
+await one('OGUZ B', 'Oguz B');
+await status('oguz', 'ambiguous', { last4: '5883' }); // same last 4 digits: still asks
+await one('Sikor', 'Sikor P', { last4: '5883' });
+await status('Sikor', 'none', { last4: '0000' });
+await one('Ali', 'Ali D', { role: 'technician' });
+await status('Ali Klant', 'none', { role: 'technician' }); // customers have no alias, techs resolve from the tech book
+await status('Ali', 'none', { role: 'customer' });
+await status('Ali', 400, { last4: 'abc' });
+await status('Ali', 400, { role: 'boss' });
+await status('', 400);
+await status(null, 400);
+
+const note = async (text: string, want: string | number, check?: (b: Row) => void, opts = {}) => {
+  const r = await resolveNote(db, text, opts);
+  assert.equal(r.body.status ?? r.status, want, `${text} -> ${want}`);
+  check?.(r.body);
+  cases++;
+};
+await note('Ali, Mehmet en Oğuz', 'ask', (b) => {
+  assert.equal((b.results as Row[]).length, 3);
+  assert.deepEqual((b.ask as Row[]).map((a) => [a.input, a.status]), [['Oğuz', 'ambiguous']]);
+  assert.equal(JSON.stringify(b).includes('+31'), false);
+});
+await note('Ali ve Mehmet', 'all', (b) => assert.equal((b.recipients as string[]).length, 2));
+await note('Ali & Mehmet + Halil', 'all', (b) => assert.equal((b.recipients as string[]).length, 3));
+await note('Ali; Mehmet / Halil', 'all', (b) => assert.equal((b.recipients as string[]).length, 3));
+await note('Ali, ali', 'all', (b) => assert.equal((b.recipients as string[]).length, 1)); // same person twice
+await note('Ali, Alihan', 'all', (b) => assert.equal((b.recipients as string[]).length, 2));
+await note('Ali, Veli', 'ask', (b) => assert.equal((b.ask as Row[])[0].status, 'none'));
+await note('Ali en Mehmet', 'all', undefined, { role: 'technician' });
+await note('', 400);
+await note('a, b, c, d, e, f, g, h, i, j, k', 400);
+
+// --- S3: every customer who writes is saved as a contact ---
+const inbound = (over: Row = {}) => ({ phone: '06 99 00 45 67', providerMessageId: 'wamid.IN1', body: 'Sleutel kwijt', waName: 'Jan Test', ...over });
+let ib = await recordInbound(db, inbound());
+assert.equal(ib.status, 201);
+assert.equal(ib.body.created, true);
+assert.equal(ib.body.role, 'customer');
+const jan = rows('contacts').find((c) => c.phone_e164 === '+31699004567')!;
+assert.equal(jan.display_name, 'Jan Test');
+assert.equal(jan.role, 'customer');
+assert.equal(rows('job_events').filter((e) => e.provider_message_id === 'wamid.IN1').length, 1);
+cases++;
+ib = await recordInbound(db, inbound());
+assert.equal(ib.body.duplicate, true, 'a replay changes nothing');
+assert.equal(rows('job_events').filter((e) => e.provider_message_id === 'wamid.IN1').length, 1);
+cases++;
+ib = await recordInbound(db, inbound({ providerMessageId: 'wamid.IN2', waName: 'Ander Naam' }));
+assert.equal(ib.body.created, false);
+assert.equal(jan.display_name, 'Jan Test', 'a later name never overwrites');
+assert.equal(rows('contacts').filter((c) => c.phone_e164 === '+31699004567').length, 1);
+cases++;
+ib = await recordInbound(db, inbound({ phone: '0622222222', providerMessageId: 'wamid.IN3' }));
+assert.equal(ib.body.role, 'technician', 'a technician is never turned into a customer');
+cases++;
+ib = await recordInbound(db, inbound({ phone: '+49 151 0000 0001', providerMessageId: 'wamid.IN4', waName: null }));
+const de = rows('contacts').find((c) => c.phone_e164 === '+4915100000001')!;
+assert.equal(de.country, 'DE');
+assert.equal(de.language, 'de');
+assert.equal(de.display_name, 'Klant 0001', 'no name: last 4 digits only, never the full number');
+cases++;
+assert.equal((await recordInbound(db, inbound({ phone: 'abc' }))).status, 400);
+assert.equal((await recordInbound(db, inbound({ providerMessageId: '' }))).status, 400);
+cases += 2;
+assert.ok(cases >= 30, `S3 cases: ${cases}`);
+
 // --- Shadow: nothing in this module can send, and no row ever moved past approved ---
 const exported = Object.keys(jobRoom);
 assert.equal(exported.some((n) => /send|claim|report|deliver/i.test(n)), false, 'no send path exported');
@@ -234,4 +334,4 @@ assert.equal(
   'the audit log holds no customer data'
 );
 
-console.log('check-jobroom: all passed');
+console.log(`check-jobroom: all passed (${cases} S3 cases)`);

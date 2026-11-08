@@ -30,7 +30,6 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
 /** A trimmed string within a length, or null. Control characters are stripped. */
 export function clean(value: unknown, max: number): string | null {
   if (typeof value !== 'string') return null;
-  // eslint-disable-next-line no-control-regex
   const text = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim();
   return text && text.length <= max ? text : null;
 }
@@ -130,13 +129,13 @@ type Row = Record<string, unknown>;
 async function upsertContact(
   supabase: SupabaseClient,
   c: ContactInput
-): Promise<{ id: string; created: boolean } | { error: string }> {
+): Promise<{ id: string; created: boolean; role: string } | { error: string }> {
   const now = new Date().toISOString();
-  const found = await supabase.from('contacts').select('id').eq('phone_e164', c.phone).maybeSingle();
+  const found = await supabase.from('contacts').select('id, role').eq('phone_e164', c.phone).maybeSingle();
   if (found.error) return { error: found.error.message };
   if (found.data) {
     await supabase.from('contacts').update({ last_contact_at: now }).eq('id', found.data.id);
-    return { id: found.data.id as string, created: false };
+    return { id: found.data.id as string, created: false, role: found.data.role as string };
   }
   const ins = await supabase
     .from('contacts')
@@ -154,11 +153,11 @@ async function upsertContact(
     .select('id')
     .single();
   if (ins.error?.code === '23505') {
-    const again = await supabase.from('contacts').select('id').eq('phone_e164', c.phone).maybeSingle();
-    if (again.data) return { id: again.data.id as string, created: false };
+    const again = await supabase.from('contacts').select('id, role').eq('phone_e164', c.phone).maybeSingle();
+    if (again.data) return { id: again.data.id as string, created: false, role: again.data.role as string };
   }
   if (ins.error || !ins.data) return { error: ins.error?.message ?? 'insert failed' };
-  return { id: ins.data.id as string, created: true };
+  return { id: ins.data.id as string, created: true, role: c.role };
 }
 
 /** POST: save a contact (every customer who writes) and optionally one explicit alias. */
@@ -168,6 +167,17 @@ export async function saveContact(supabase: SupabaseClient, raw: unknown): Promi
   if (typeof parsed === 'string') return bad(parsed);
   const saved = await upsertContact(supabase, parsed);
   if ('error' in saved) return bad('Opslaan mislukt', 500);
+
+  // A technician, garage or staff member is always findable by the full name
+  // they were saved under. This is identity, not a guess, so it needs no pick.
+  if (saved.created && parsed.role !== 'customer') {
+    await supabase.from('contact_aliases').insert({
+      contact_id: saved.id,
+      alias: parsed.name,
+      alias_folded: foldName(parsed.name),
+      source: 'system',
+    });
+  }
 
   const alias = clean(raw.alias, 120);
   if (alias) {
@@ -190,7 +200,11 @@ export async function saveContact(supabase: SupabaseClient, raw: unknown): Promi
  * GET: exact alias match after folding. One hit resolves; none or several
  * return the candidates so the caller asks. Fuzzy matches are never returned.
  */
-export async function resolveContact(supabase: SupabaseClient, q: string | null): Promise<Result> {
+export async function resolveContact(
+  supabase: SupabaseClient,
+  q: string | null,
+  opts: { role?: string | null; last4?: string | null } = {}
+): Promise<Result> {
   const name = clean(q, 120);
   if (!name) return bad('Naam ontbreekt');
   const folded = foldName(name);
@@ -205,12 +219,21 @@ export async function resolveContact(supabase: SupabaseClient, q: string | null)
   const ids = [...new Set((aliases.data ?? []).map((a) => a.contact_id as string))];
   if (ids.length === 0) return ok({ status: 'none', candidates: [] });
 
-  const contacts = await supabase
+  const role = opts.role ? oneOf(opts.role, ROLES) : null;
+  if (opts.role && !role) return bad('Ongeldige rol');
+  const last4 = opts.last4 && /^\d{4}$/.test(opts.last4) ? opts.last4 : null;
+  if (opts.last4 && !last4) return bad('Ongeldige laatste 4 cijfers');
+
+  let lookup = supabase
     .from('contacts')
     .select('id, display_name, role, city, phone_e164')
     .in('id', ids)
     .eq('active', true);
+  // Technicians resolve only from the technician book.
+  if (role) lookup = lookup.eq('role', role);
+  const contacts = await lookup;
   if (contacts.error) return bad('Zoeken mislukt', 500);
+  if (last4) contacts.data = (contacts.data ?? []).filter((c: Row) => String(c.phone_e164).endsWith(last4));
 
   // Only the last 4 digits leave this function, enough to tell two people apart.
   const candidates = (contacts.data ?? []).map((c: Row) => ({
@@ -500,4 +523,93 @@ export async function runOps(
   // The action and the outcome, never the message text or the number.
   await logOps(supabase, action, { status: result.status });
   return json(result);
+}
+
+// ---------------------------------------------------------------------------
+// S3: several names in one note, and every customer who writes
+// ---------------------------------------------------------------------------
+
+const NAME_SPLIT = /\s*(?:,|;|\/|&|\+|\n|\band\b|\ben\b|\bve\b|\bund\b)\s*/i;
+
+/**
+ * "Ali, Mehmet en Oğuz" → one lookup per name. Every name must resolve to
+ * exactly one contact; otherwise `status` is 'ask' and `ask` lists what to put
+ * to the owner (numbered choices with name, city and last 4 digits). Nothing
+ * here guesses: a name with no exact alias is `none`, never the nearest match.
+ */
+export async function resolveNote(
+  supabase: SupabaseClient,
+  text: string | null,
+  opts: { role?: string | null } = {}
+): Promise<Result> {
+  const note = clean(text, 400);
+  if (!note) return bad('Naam ontbreekt');
+  const names = [...new Set(note.split(NAME_SPLIT).map((n) => n.trim()).filter(Boolean))];
+  if (names.length === 0 || names.length > 10) return bad('Ongeldig aantal namen');
+
+  const results: Row[] = [];
+  for (const name of names) {
+    const r = await resolveContact(supabase, name, opts);
+    if (r.status !== 200) return r;
+    results.push({ input: name, status: r.body.status, contact: r.body.contact ?? null, candidates: r.body.candidates });
+  }
+
+  // Two different names that land on the same person are one recipient.
+  const picked = new Set<string>();
+  for (const r of results) {
+    const id = (r.contact as Row | null)?.id as string | undefined;
+    if (id && picked.has(id)) r.status = 'duplicate';
+    if (id) picked.add(id);
+  }
+  const ask = results.filter((r) => r.status === 'none' || r.status === 'ambiguous');
+  return ok({
+    status: ask.length === 0 ? 'all' : 'ask',
+    recipients: [...picked],
+    results,
+    ask: ask.map((r) => ({ input: r.input, status: r.status, candidates: r.candidates })),
+  });
+}
+
+/**
+ * POST: a message arrived from a number. The sender is saved as a contact at
+ * once (a number already known keeps its role: a technician is never turned
+ * into a customer), and the raw message is logged before anything reads it.
+ */
+export async function recordInbound(supabase: SupabaseClient, raw: unknown): Promise<Result> {
+  if (!isObject(raw)) return bad('Ongeldige invoer');
+  const phone = toE164NL(typeof raw.phone === 'string' ? raw.phone : null);
+  if (!phone || !/^\+[1-9][0-9]{7,14}$/.test(phone)) return bad('Ongeldig telefoonnummer');
+  const providerMessageId = clean(raw.providerMessageId, 200);
+  if (!providerMessageId) return bad('Bericht-id ontbreekt');
+  const channel = oneOf(raw.channel, CHANNELS) ?? 'whatsapp';
+  const waName = clean(raw.waName, 120);
+  if (raw.jobRoomId !== undefined && raw.jobRoomId !== null && !isUuid(raw.jobRoomId)) return bad('Ongeldige klus');
+
+  const german = phone.startsWith('+49');
+  const saved = await upsertContact(supabase, {
+    phone,
+    name: waName ?? `Klant ${phone.slice(-4)}`,
+    role: 'customer',
+    country: german ? 'DE' : 'NL',
+    language: german ? 'de' : 'nl',
+    waName,
+    city: null,
+  });
+  if ('error' in saved) return bad('Opslaan mislukt', 500);
+
+  const ev = await recordEvent(supabase, {
+    direction: 'in',
+    channel,
+    actor: 'transport',
+    kind: 'message',
+    providerMessageId,
+    contactId: saved.id,
+    jobRoomId: raw.jobRoomId ?? null,
+    body: typeof raw.body === 'string' ? raw.body : null,
+  });
+  if (ev.status >= 500) return ev;
+  return ok(
+    { contactId: saved.id, created: saved.created, role: saved.role, duplicate: ev.body.duplicate === true },
+    saved.created ? 201 : 200
+  );
 }
