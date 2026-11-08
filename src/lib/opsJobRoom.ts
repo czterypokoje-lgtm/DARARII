@@ -386,6 +386,10 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
     return bad('Bericht geblokkeerd', 422, { reason: refused });
   }
 
+  // Metadata only (what is attached, and a hash of it). Needs migration 0079,
+  // so the column is written only when a caller sends one.
+  const attachment = isObject(raw.attachment) && JSON.stringify(raw.attachment).length <= 2000 ? raw.attachment : null;
+
   const textHash = sha256(body);
   const key = dedupeKey(raw.jobRoomId, raw.contactId, kind, textHash);
   const ins = await supabase
@@ -401,6 +405,7 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
       dedupe_key: key,
       state: 'proposed',
       shadow: true,
+      ...(attachment ? { attachment } : {}),
     })
     .select('id, state')
     .single();
@@ -612,4 +617,129 @@ export async function recordInbound(supabase: SupabaseClient, raw: unknown): Pro
     { contactId: saved.id, created: saved.created, role: saved.role, duplicate: ev.body.duplicate === true },
     saved.created ? 201 : 200
   );
+}
+
+// ---------------------------------------------------------------------------
+// S6: invoice send, CRM side (shadow)
+// ---------------------------------------------------------------------------
+
+const INVOICE_NUMBER = /^I-\d{5}$/;
+const euro = (n: number) => n.toFixed(2).replace('.', ',');
+
+type Snapshot = { invoiceNumber: string; status: string; total: number; jobId: string | null; hash: string };
+
+/** The invoice as it stands now: number, total and lines, hashed. Any later edit changes the hash. */
+async function invoiceSnapshot(supabase: SupabaseClient, invoiceNumber: string): Promise<Snapshot | Result> {
+  const inv = await supabase
+    .from('sales_invoices')
+    .select('id, invoice_number, status, total, subtotal, vat_total, credit_applied, job_id')
+    .eq('invoice_number', invoiceNumber)
+    .maybeSingle();
+  if (inv.error) return bad('Ophalen mislukt', 500);
+  if (!inv.data) return bad('Factuur niet gevonden', 404);
+
+  const lines = await supabase
+    .from('sales_invoice_lines')
+    .select('line_no, description, quantity, unit_price, discount, vat_rate')
+    .eq('invoice_id', inv.data.id)
+    .order('line_no', { ascending: true });
+  if (lines.error) return bad('Ophalen mislukt', 500);
+
+  const total = Number(inv.data.total) || 0;
+  const hash = sha256(
+    JSON.stringify([
+      inv.data.invoice_number, total, Number(inv.data.subtotal), Number(inv.data.vat_total),
+      Number(inv.data.credit_applied), lines.data ?? [],
+    ])
+  );
+  return {
+    invoiceNumber: inv.data.invoice_number as string,
+    status: String(inv.data.status),
+    total,
+    jobId: (inv.data.job_id as string | null) ?? null,
+    hash,
+  };
+}
+
+const isSnapshot = (v: Snapshot | Result): v is Snapshot => 'hash' in v;
+
+/**
+ * POST: propose sending one invoice to the customer of a job room. It goes
+ * through the outbox as a tier 2 row (a person approves it, `ja A7`), never
+ * straight to the customer. The text is fixed code, not model output. The
+ * invoice must belong to this job, have lines and a total, be unpaid, and the
+ * recipient must be the job's customer. Nothing is sent and Moneybird is not
+ * called; Moneybird contacts are never touched from here.
+ */
+export async function proposeInvoice(supabase: SupabaseClient, raw: unknown): Promise<Result> {
+  if (!isObject(raw)) return bad('Ongeldige invoer');
+  if (!isUuid(raw.jobRoomId)) return bad('Ongeldige klus');
+  const number = typeof raw.invoiceNumber === 'string' ? raw.invoiceNumber.trim() : '';
+  if (!INVOICE_NUMBER.test(number)) return bad('Ongeldig factuurnummer');
+  const mb = raw.moneybirdInvoiceId === undefined ? null : String(raw.moneybirdInvoiceId);
+  if (mb !== null && !/^\d{6,20}$/.test(mb)) return bad('Ongeldig Moneybird-id');
+
+  const room = await supabase
+    .from('job_rooms')
+    .select('id, job_id, customer_contact_id')
+    .eq('id', raw.jobRoomId)
+    .maybeSingle();
+  if (room.error) return bad('Ophalen mislukt', 500);
+  if (!room.data) return bad('Klus niet gevonden', 404);
+  if (!room.data.customer_contact_id) return bad('Klus heeft geen klant', 409);
+
+  const contact = await supabase
+    .from('contacts')
+    .select('id, display_name, role')
+    .eq('id', room.data.customer_contact_id)
+    .maybeSingle();
+  if (contact.error) return bad('Ophalen mislukt', 500);
+  if (!contact.data || contact.data.role !== 'customer') return bad('Ontvanger is geen klant', 409);
+
+  const snap = await invoiceSnapshot(supabase, number);
+  if (!isSnapshot(snap)) return snap;
+  if (['betaald', 'written_off'].includes(snap.status)) return bad('Factuur is al afgehandeld', 409, { status: snap.status });
+  if (!(snap.total > 0)) return bad('Factuur heeft geen bedrag', 409);
+  if (!room.data.job_id || snap.jobId !== room.data.job_id) return bad('Factuur hoort niet bij deze klus', 409);
+
+  const name = String(contact.data.display_name);
+  const greeting = /^klant \d{4}$/i.test(name) ? 'Beste klant' : `Beste ${name}`;
+  const body = `${greeting}, hierbij de factuur ${snap.invoiceNumber} van Autosleutel24, totaal € ${euro(snap.total)}. Betalen kan binnen 14 dagen. Bedankt!`;
+
+  const proposed = await proposeOutbox(supabase, {
+    jobRoomId: room.data.id,
+    contactId: contact.data.id,
+    audience: 'self_started',
+    kind: `invoice:${snap.invoiceNumber}:${snap.hash.slice(0, 12)}`,
+    tier: 2,
+    body,
+    attachment: {
+      type: 'invoice_pdf',
+      invoiceNumber: snap.invoiceNumber,
+      total: snap.total,
+      snapshotHash: snap.hash,
+      ...(mb ? { moneybirdInvoiceId: mb } : {}),
+    },
+  });
+  return proposed.status === 201 || proposed.status === 200
+    ? { status: proposed.status, body: { ...proposed.body, invoiceNumber: snap.invoiceNumber, textHash: sha256(body), body } }
+    : proposed;
+}
+
+/**
+ * GET: is the invoice behind this outbox row still the one that was approved?
+ * The transport asks this right before attaching it; `unchanged: false` means
+ * propose again and get a new approval.
+ */
+export async function verifyInvoice(supabase: SupabaseClient, outboxId: string | null): Promise<Result> {
+  if (!isUuid(outboxId)) return bad('Ongeldig bericht');
+  const row = await supabase.from('job_outbox').select('id, state, attachment').eq('id', outboxId).maybeSingle();
+  if (row.error) return bad('Ophalen mislukt', 500);
+  const att = row.data?.attachment as Row | null | undefined;
+  if (!row.data || !att || att.type !== 'invoice_pdf') return bad('Geen factuurbericht', 404);
+
+  const snap = await invoiceSnapshot(supabase, String(att.invoiceNumber));
+  if (!isSnapshot(snap)) return snap;
+  const unchanged = snap.hash === att.snapshotHash && !['betaald', 'written_off'].includes(snap.status);
+  return ok({ unchanged, state: row.data.state, invoiceNumber: snap.invoiceNumber, status: snap.status });
 }

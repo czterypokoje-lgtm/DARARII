@@ -11,7 +11,7 @@ import * as jobRoom from '../src/lib/opsJobRoom.ts';
 
 const {
   runOps, openJobRoom, recordEvent, proposeOutbox, decideApproval, listOutbox,
-  saveContact, resolveContact, resolveNote, recordInbound, foldName, guardText, sha256,
+  saveContact, resolveContact, resolveNote, recordInbound, proposeInvoice, verifyInvoice, foldName, guardText, sha256,
 } = jobRoom;
 
 process.env.OPS_API_TOKEN = 'x'.repeat(40);
@@ -323,6 +323,76 @@ assert.equal((await recordInbound(db, inbound({ phone: 'abc' }))).status, 400);
 assert.equal((await recordInbound(db, inbound({ providerMessageId: '' }))).status, 400);
 cases += 2;
 assert.ok(cases >= 30, `S3 cases: ${cases}`);
+
+// --- S6: invoice send, CRM side (shadow) ---
+const jobUuid = randomUUID();
+rows('job_rooms')[0].job_id = jobUuid;
+const addInvoice = (number: string, over: Row = {}, lineCount = 1) => {
+  const id = randomUUID();
+  rows('sales_invoices').push({ id, invoice_number: number, status: 'concept', total: 149.5, subtotal: 123.55, vat_total: 25.95, credit_applied: 0, job_id: jobUuid, ...over });
+  for (let i = 0; i < lineCount; i++) {
+    rows('sales_invoice_lines').push({ invoice_id: id, line_no: i, description: 'Sleutel bijmaken', quantity: 1, unit_price: 123.55, discount: 0, vat_rate: 21 });
+  }
+  return id;
+};
+const invId = addInvoice('I-00001');
+const inv = (over: Row = {}) => ({ jobRoomId: roomId, invoiceNumber: 'I-00001', ...over });
+
+let iv = await proposeInvoice(db, inv({ moneybirdInvoiceId: '123456789012' }));
+assert.equal(iv.status, 201);
+assert.equal(iv.body.shadow, true);
+const invOutbox = rows('job_outbox').find((o) => o.id === iv.body.outboxId)!;
+assert.equal(invOutbox.tier, 2, 'an invoice always needs a person');
+assert.equal(invOutbox.state, 'proposed');
+assert.equal(invOutbox.shadow, true);
+assert.equal(invOutbox.audience, 'self_started');
+assert.equal(invOutbox.attachment.type, 'invoice_pdf');
+assert.equal(invOutbox.attachment.moneybirdInvoiceId, '123456789012');
+assert.match(invOutbox.body, /I-00001.*€ 149,50/);
+assert.equal(guardText(invOutbox.body, 'customer_reply'), null);
+
+iv = await proposeInvoice(db, inv());
+assert.equal(iv.body.duplicate, true, 'the same invoice is one row');
+
+// Approval of the invoice text, then the snapshot check
+const ivRow = invOutbox;
+a = await decideApproval(db, { outboxId: ivRow.id, decision: 'approved', decidedBy: 'owner', via: 'owner_voice', textHash: ivRow.text_hash });
+assert.equal(a.status, 201);
+assert.equal(rows('job_outbox').find((o) => o.id === ivRow.id)!.state, 'approved');
+let vf = await verifyInvoice(db, ivRow.id);
+assert.equal(vf.body.unchanged, true);
+
+// The invoice is edited after approval: the approval no longer covers it
+rows('sales_invoice_lines').find((l) => l.invoice_id === invId)!.unit_price = 200;
+vf = await verifyInvoice(db, ivRow.id);
+assert.equal(vf.body.unchanged, false, 'an edited invoice needs a new approval');
+rows('sales_invoice_lines').find((l) => l.invoice_id === invId)!.unit_price = 123.55;
+rows('sales_invoices').find((i) => i.id === invId)!.status = 'betaald';
+assert.equal((await verifyInvoice(db, ivRow.id)).body.unchanged, false, 'paid in the meantime');
+assert.equal((await proposeInvoice(db, inv())).status, 409, 'a paid invoice is not sent');
+rows('sales_invoices').find((i) => i.id === invId)!.status = 'verzonden';
+assert.equal((await proposeInvoice(db, inv())).status, 200, 'a sent invoice may be sent again, same row');
+
+// Refusals
+assert.equal((await proposeInvoice(db, inv({ invoiceNumber: 'I-99999' }))).status, 404);
+assert.equal((await proposeInvoice(db, inv({ invoiceNumber: 'x' }))).status, 400);
+assert.equal((await proposeInvoice(db, inv({ moneybirdInvoiceId: 'abc' }))).status, 400);
+assert.equal((await proposeInvoice(db, inv({ jobRoomId: 'nope' }))).status, 400);
+assert.equal((await proposeInvoice(db, inv({ jobRoomId: randomUUID() }))).status, 404);
+addInvoice('I-00002', { job_id: randomUUID() });
+assert.equal((await proposeInvoice(db, inv({ invoiceNumber: 'I-00002' }))).status, 409, 'invoice of another job');
+addInvoice('I-00003', { job_id: null });
+assert.equal((await proposeInvoice(db, inv({ invoiceNumber: 'I-00003' }))).status, 409, 'invoice not linked to any job');
+addInvoice('I-00004', { total: 0 });
+assert.equal((await proposeInvoice(db, inv({ invoiceNumber: 'I-00004' }))).status, 409, 'no amount');
+const noCustomer = await openJobRoom(db, { leadId: randomUUID() });
+assert.equal((await proposeInvoice(db, inv({ jobRoomId: noCustomer.body.jobRoomId }))).status, 409, 'room without a customer');
+const techRoom = await openJobRoom(db, { leadId: randomUUID(), customer: { phone: '0622222222', name: 'Ali D' } });
+rows('job_rooms').find((r) => r.id === techRoom.body.jobRoomId)!.job_id = jobUuid;
+assert.equal((await proposeInvoice(db, inv({ jobRoomId: techRoom.body.jobRoomId }))).status, 409, 'never to a technician');
+assert.equal((await verifyInvoice(db, outboxId)).status, 404, 'a plain message has no invoice');
+assert.equal(Object.keys(tables).some((t) => /moneybird/i.test(t)), false, 'Moneybird is never written from here');
+assert.ok(rows('job_outbox').every((o) => o.shadow === true && ['proposed', 'approved', 'cancelled'].includes(o.state)));
 
 // --- Shadow: nothing in this module can send, and no row ever moved past approved ---
 const exported = Object.keys(jobRoom);
