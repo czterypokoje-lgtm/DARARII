@@ -61,7 +61,7 @@ export default async function LivePage() {
           <Table head={<><th>Klus</th><th>Soort</th><th>Voor</th><th>Tier</th><th>Status</th><th>Wacht</th></>}>
             {live.outbox.slice(0, 30).map((o) => (
               <tr key={o.id}>
-                <td>{live.codeOf(o.job_room_id)}</td>
+                <td style={{ whiteSpace: 'nowrap' }}>{live.codeOf(o.job_room_id)}</td>
                 <td>{o.kind.split(':')[0]}</td>
                 <td>{o.audience}</td>
                 <td>{o.tier}</td>
@@ -82,7 +82,7 @@ export default async function LivePage() {
             {live.events.slice(0, 60).map((e) => (
               <tr key={e.id}>
                 <td>{fmtTime(e.created_at)}</td>
-                <td>{live.codeOf(e.job_room_id)}</td>
+                <td style={{ whiteSpace: 'nowrap' }}>{live.codeOf(e.job_room_id)}</td>
                 <td>{e.direction === 'in' ? '←' : e.direction === 'out' ? '→' : '·'}</td>
                 <td>{e.kind}</td>
                 <td>{feedText(e)}</td>

@@ -558,6 +558,8 @@ export function verifyApproval(token: unknown, secret: string, nowSec: number): 
   if (typeof token !== 'string' || token.length > 2000) return null;
   const [payload, mac, extra] = token.split('.');
   if (!payload || !mac || extra !== undefined) return null;
+  // Exactly base64url: Node's decoder would silently ignore stray characters, so a padded or spaced token is not the token that was signed.
+  if (!/^[A-Za-z0-9_-]+$/.test(payload) || !/^[A-Za-z0-9_-]+$/.test(mac)) return null;
   const want = createHmac('sha256', secret).update(payload).digest();
   let got: Buffer;
   try { got = Buffer.from(mac, 'base64url'); } catch { return null; }
@@ -602,11 +604,14 @@ async function findApprover(supabase: SupabaseClient, phone: string): Promise<Ap
   };
 }
 
-const isInvoiceRow = (o: { kind: string; attachment?: unknown }) =>
-  /invoice|factuur/i.test(o.kind) || (isObject(o.attachment) && o.attachment.type === 'invoice_pdf');
+/** An invoice by its kind, its attachment, or because its text talks about one (a generic message cannot pass as "not an invoice"). */
+const isInvoiceRow = (o: { kind: string; body?: string; attachment?: unknown }) =>
+  /invoice|factuur|rekening|iban/i.test(o.kind) ||
+  /factuur|invoice|\biban\b|\bnl\d{2}\s?[a-z]{4}/i.test(o.body ?? '') ||
+  (isObject(o.attachment) && o.attachment.type === 'invoice_pdf');
 
 /** What this approver may release. An owner may release everything; an assistant only what was granted. */
-function mayRelease(a: Approver, o: { audience: string; tier: number; kind: string; attachment?: unknown }): string | null {
+function mayRelease(a: Approver, o: { audience: string; tier: number; kind: string; body?: string; attachment?: unknown }): string | null {
   if (a.role === 'owner') return null;
   if (isInvoiceRow(o) && !a.may_invoice) return 'invoice';
   if (o.tier > a.max_tier) return 'tier';
@@ -666,7 +671,7 @@ export async function decideApproval(
   if (!approver) return refuse('not_approver', 403, 'Geen goedkeuringsrecht');
   // The channel must match the person: an assistant only through the assistant path, an owner never through it.
   if ((approver.role === 'assistant') !== (via === 'assistant')) return refuse('wrong_channel', 403, 'Verkeerd kanaal');
-  const lacking = mayRelease(approver, { ...(found.data as { audience: string; tier: number; kind: string }), attachment });
+  const lacking = mayRelease(approver, { ...(found.data as { audience: string; tier: number; kind: string; body: string }), attachment });
   if (lacking) return refuse(`not_allowed_${lacking}`, 403, 'Geen recht voor dit bericht');
 
   if (found.data.state !== 'proposed') return bad('Bericht is al behandeld', 409, { state: found.data.state });

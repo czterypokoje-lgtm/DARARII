@@ -6,7 +6,7 @@
 --    columns (state, approval, claim, result) may change. This is what makes the
 --    approval hash mean something: the text, recipient, audience, tier, kind and
 --    attachment an approver saw are the ones that go out.
--- 2. The shadow flag cannot be turned off. Going live is a deliberate later
+-- 2. The shadow flag cannot be turned off, and no row can be inserted without it. Going live is a deliberate later
 --    migration that drops job_outbox_immutable_trg, not a code path.
 -- 3. job_events and job_approvals are append-only; job_outbox rows are never
 --    deleted. (A job room therefore cannot be deleted either: its events would
@@ -30,6 +30,14 @@ begin
   if tg_op = 'DELETE' then
     raise exception 'job_outbox rows are never deleted';
   end if;
+  if tg_op = 'INSERT' then
+    -- Shadow rows only, until go-live drops this trigger. A row inserted with
+    -- shadow = false would sidestep the lock on the flag.
+    if new.shadow is distinct from true then
+      raise exception 'job_outbox: only shadow rows may be inserted before go-live';
+    end if;
+    return new;
+  end if;
   if (to_jsonb(new) - progress) is distinct from (to_jsonb(old) - progress) then
     raise exception 'job_outbox: only progress columns may change after insert (shadow included)';
   end if;
@@ -38,7 +46,7 @@ end $$;
 
 drop trigger if exists job_outbox_immutable_trg on public.job_outbox;
 create trigger job_outbox_immutable_trg
-  before update or delete on public.job_outbox
+  before insert or update or delete on public.job_outbox
   for each row execute function public.job_outbox_immutable();
 
 create or replace function public.job_append_only()

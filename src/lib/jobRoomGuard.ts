@@ -12,17 +12,30 @@
 export type Audience = 'customer_reply' | 'technician' | 'self_started' | 'internal';
 export type Finding = 'secret' | 'phone' | 'email' | 'plate';
 
-const ZERO_WIDTH = new RegExp('[\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\ufeff\\u00ad]', 'g');
+const ZERO_WIDTH = new RegExp('[\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\ufeff\\u00ad\\ufe0f\\u20e3\\u034f\\u180e]', 'g');
+const DASHES = new RegExp('[\\u2010-\\u2015\\u2212\\ufe58\\ufe63\\uff0d]', 'g');
+
+/** First code point of the digit blocks NFKC leaves alone (Arabic-Indic, Devanagari, Thai ...). */
+const DIGIT_ZEROS = [0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xe50, 0xed0, 0xf20, 0x1040, 0x17e0, 0x1810, 0xa620, 0xa8d0, 0xa900, 0xff10];
+
+/** Any decimal digit of any script becomes 0-9. */
+function asciiDigits(text: string): string {
+  return text.replace(/\p{Nd}/gu, (c) => {
+    const cp = c.codePointAt(0)!;
+    const zero = DIGIT_ZEROS.find((z) => cp >= z && cp <= z + 9);
+    return zero === undefined ? c : String(cp - zero);
+  });
+}
 
 /** NFKC (full-width digits, ligatures), no zero-width or soft hyphens, lower case. */
 export function normalize(text: string): string {
-  return text.normalize('NFKC').replace(ZERO_WIDTH, '').toLowerCase();
+  return asciiDigits(text.normalize('NFKC').replace(ZERO_WIDTH, '').replace(DASHES, '-')).toLowerCase();
 }
 
 // --- digit words (nl, en, de, tr) --------------------------------------
 
 const UNITS: Record<string, string> = {
-  nul: '0', zero: '0', null: '0', 'sıfır': '0', sifir: '0',
+  nul: '0', zero: '0', null: '0', oh: '0', 'sıfır': '0', sifir: '0',
   een: '1', 'eén': '1', one: '1', eins: '1', ein: '1', bir: '1',
   twee: '2', two: '2', zwei: '2', iki: '2',
   drie: '3', three: '3', drei: '3', 'üç': '3', uc: '3',
@@ -34,6 +47,12 @@ const UNITS: Record<string, string> = {
   negen: '9', nine: '9', neun: '9', dokuz: '9',
 };
 const TENS: Record<string, string> = {
+  on: '10', yirmi: '20', otuz: '30', 'kırk': '40', kirk: '40', elli: '50', 'altmış': '60', altmis: '60',
+  'yetmiş': '70', yetmis: '70', seksen: '80', doksan: '90',
+  elf: '11', twaalf: '12', dertien: '13', veertien: '14', vijftien: '15', zestien: '16', zeventien: '17', achttien: '18', negentien: '19',
+  eleven: '11', twelve: '12', thirteen: '13', fourteen: '14', fifteen: '15', sixteen: '16', seventeen: '17', eighteen: '18', nineteen: '19',
+  'zwölf': '12', zwolf: '12', dreizehn: '13', vierzehn: '14', 'fünfzehn': '15', sechzehn: '16', siebzehn: '17', achtzehn: '18', neunzehn: '19',
+  zwanzig: '20', dreissig: '30', 'dreißig': '30', vierzig: '40', 'fünfzig': '50', sechzig: '60', siebzig: '70', achtzig: '80', neunzig: '90',
   tien: '10', ten: '10', twintig: '20', twenty: '20', dertig: '30', thirty: '30',
   veertig: '40', forty: '40', vijftig: '50', fifty: '50', zestig: '60', sixty: '60',
   zeventig: '70', seventy: '70', tachtig: '80', eighty: '80', negentig: '90', ninety: '90',
@@ -83,7 +102,7 @@ function hasEmail(normalized: string): boolean {
   // "naam at gmail punt com", "naam (at) gmail [dot] com"
   const spelled = normalized
     .replace(/[([{]\s*(?:at|ät)\s*[)\]}]|(?<![a-z])(?:at|ät|apenstaartje)(?![a-z])/g, '@')
-    .replace(/[([{]\s*dot\s*[)\]}]|(?<![a-z])(?:dot|punt)(?![a-z])/g, '.')
+    .replace(/[([{]\s*(?:dot|punt)\s*[)\]}]|(?<![a-z])(?:dot|punt)(?![a-z])/g, '.')
     .replace(/\s*([@.])\s*/g, '$1');
   return EMAIL.test(spelled);
 }
@@ -152,7 +171,7 @@ function hasHighEntropyToken(original: string): boolean {
 }
 
 function hasSecret(original: string, normalized: string): boolean {
-  return SECRET_PATTERNS.some((p) => p.test(normalized)) || hasHighEntropyToken(original.normalize('NFKC'));
+  return SECRET_PATTERNS.some((p) => p.test(normalized)) || hasHighEntropyToken(original.normalize('NFKC').replace(ZERO_WIDTH, ''));
 }
 
 // --- verdicts ------------------------------------------------------------------

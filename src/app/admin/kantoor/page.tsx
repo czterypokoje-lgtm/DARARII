@@ -55,7 +55,7 @@ export default async function KantoorPage({
             <tr key={d.key}>
               <td><Link href={`/admin/kantoor?bureau=${d.key}`}>{d.label}</Link></td>
               <td><Badge tone={STATE_TONE[d.state]}>{STATE_LABEL[d.state]}</Badge></td>
-              <td>{live.codeOf(d.jobRoomId)}</td>
+              <td style={{ whiteSpace: 'nowrap' }}>{live.codeOf(d.jobRoomId)}</td>
               <td>{d.lastAction ?? '—'}</td>
               <td>{d.lastAt ? fmtTime(d.lastAt) : '—'}</td>
               <td>{d.waiting || '—'}</td>
@@ -74,7 +74,7 @@ export default async function KantoorPage({
               {selectedEvents.map((e) => (
                 <tr key={e.id}>
                   <td>{fmtTime(e.created_at)}</td>
-                  <td>{live.codeOf(e.job_room_id)}</td>
+                  <td style={{ whiteSpace: 'nowrap' }}>{live.codeOf(e.job_room_id)}</td>
                   <td>{e.kind}</td>
                   <td>{feedText(e)}</td>
                   <td><Badge tone={e.status === 'blocked' || e.status === 'error' ? 'stop' : 'ok'}>{e.status}</Badge></td>
