@@ -28,8 +28,27 @@ function asciiDigits(text: string): string {
 }
 
 /** NFKC (full-width digits, ligatures), no zero-width or soft hyphens, lower case. */
+/** Cyrillic and Greek letters that look like Latin ones: "nl91 аbna" with a Cyrillic а is still an IBAN. */
+const HOMOGLYPHS: Record<string, string> = {
+  'а': 'a', 'в': 'b', 'е': 'e', 'к': 'k', 'м': 'm', 'н': 'h', 'о': 'o', 'р': 'p', 'с': 'c', 'т': 't', 'у': 'y', 'х': 'x',
+  'і': 'i', 'ј': 'j', 'ѕ': 's', 'ԁ': 'd', 'ԛ': 'q', 'ο': 'o', 'α': 'a', 'ε': 'e', 'ι': 'i', 'κ': 'k', 'ν': 'v', 'ρ': 'p',
+  'τ': 't', 'υ': 'u', 'χ': 'x', 'ɡ': 'g', 'ɩ': 'l', 'ӏ': 'l',
+};
+const HOMOGLYPH_RE = new RegExp(`[${Object.keys(HOMOGLYPHS).join('')}]`, 'g');
+const STOPS = new RegExp('[\\u3002\\u2024\\u2027]', 'g');
+
+/** Capitals that look like Latin capitals (Greek capital Nu is an N; its lower case looks like a v), mapped before lower-casing. */
+const HOMOGLYPHS_UPPER: Record<string, string> = {
+  'А': 'a', 'В': 'b', 'Е': 'e', 'К': 'k', 'М': 'm', 'Н': 'h', 'О': 'o', 'Р': 'p', 'С': 'c', 'Т': 't', 'У': 'y', 'Х': 'x',
+  'Α': 'a', 'Β': 'b', 'Ε': 'e', 'Ζ': 'z', 'Η': 'h', 'Ι': 'i', 'Κ': 'k', 'Μ': 'm', 'Ν': 'n', 'Ο': 'o', 'Ρ': 'p', 'Τ': 't', 'Υ': 'y', 'Χ': 'x',
+};
+const HOMOGLYPH_UP_RE = new RegExp(`[${Object.keys(HOMOGLYPHS_UPPER).join('')}]`, 'g');
+
 export function normalize(text: string): string {
-  return asciiDigits(text.normalize('NFKC').replace(ZERO_WIDTH, '').replace(DASHES, '-')).toLowerCase();
+  const base = asciiDigits(
+    text.normalize('NFKC').replace(ZERO_WIDTH, '').replace(DASHES, '-').replace(STOPS, '.').replace(HOMOGLYPH_UP_RE, (c) => HOMOGLYPHS_UPPER[c] ?? c)
+  ).toLowerCase();
+  return base.replace(HOMOGLYPH_RE, (c) => HOMOGLYPHS[c] ?? c);
 }
 
 // --- digit words (nl, en, de, tr) --------------------------------------
@@ -59,10 +78,11 @@ const TENS: Record<string, string> = {
 };
 const L = 'a-zà-ÿıİğşçöü';
 const word = (alts: string) => new RegExp(`(?<![${L}])(?:${alts})(?![${L}])`, 'g');
-const COMPOUND = new RegExp(
-  `(?<![${L}])(een|twee|drie|vier|vijf|zes|zeven|acht|negen)en(twintig|dertig|veertig|vijftig|zestig|zeventig|tachtig|negentig)(?![${L}])`,
-  'g'
-);
+const byLength = (words: string[]) => [...words].sort((x, y) => y.length - x.length).join('|');
+const UNIT_WORDS = byLength(Object.keys(UNITS).filter((w) => UNITS[w] !== '0' && w !== 'oh'));
+const TEN_WORDS = byLength(Object.keys(TENS).filter((w) => Number(TENS[w]) >= 20 && Number(TENS[w]) % 10 === 0));
+/** "drieëntwintig", "vijf en veertig", "dreiundzwanzig": unit, "en"/"ën"/"und", tens (with or without spaces). */
+const COMPOUND = new RegExp(`(?<![${L}])(${UNIT_WORDS})\\s?(?:en|ën|und)\\s?(${TEN_WORDS})(?![${L}])`, 'g');
 const UNIT_RE = word(Object.keys(UNITS).join('|'));
 const TENS_RE = word(Object.keys(TENS).join('|'));
 
@@ -138,7 +158,9 @@ const isPlate = (compact: string) =>
 function hasPlate(normalized: string): boolean {
   const chunks = [...normalized.matchAll(/[a-z0-9]+/g)].map((m) => ({ text: m[0], start: m.index!, end: m.index! + m[0].length }));
   for (let i = 0; i < chunks.length; i++) {
-    if (isPlate(chunks[i].text)) return true; // written without separators
+    // Written without separators. "3511AB" is the same shape as sidecode 2 (99-99-XX) and every quote
+    // carries postcodes, so that one layout counts as a plate only when it is written with separators.
+    if (isPlate(chunks[i].text) && !/^\d{4}[a-z]{2}$/.test(chunks[i].text)) return true;
     // "AB-12CD": two chunks, hyphen only (a space would make "50 voor" look like 99-XX-XX)
     if (i + 1 < chunks.length && normalized.slice(chunks[i].end, chunks[i + 1].start) === '-' && !STOP.has(chunks[i].text) && !STOP.has(chunks[i + 1].text)) {
       if (isPlate(chunks[i].text + chunks[i + 1].text)) return true;
@@ -199,29 +221,34 @@ function ibanValid(compact: string): boolean {
 
 function hasIban(normalized: string): boolean {
   if (/(?<![a-z])iban(?![a-z])/.test(normalized)) return true;
-  return (normalized.match(/[a-z]{2}\d{2}(?:[\s.\-_]?[a-z0-9]){11,30}/g) ?? []).some((m) => {
+  return (normalized.match(/[a-z]{2}\d{2}(?:[^a-z0-9]{0,3}[a-z0-9]){11,30}/g) ?? []).some((m) => {
     const compact = m.replace(/[^a-z0-9]/g, '');
     for (let n = Math.min(compact.length, 34); n >= 15; n--) if (ibanValid(compact.slice(0, n))) return true;
     return false;
   });
 }
 
-const TLD = 'com|nl|de|net|org|tk|ml|ga|cf|gq|xyz|top|info|biz|io|me|co|eu|be|app|link|click|online|site|shop|store|live|icu|ru|cn|pw|cc|ws|to|ly|gl|tr|uk|fr|es|it|pl';
-const URL_RE = new RegExp(`(?:https?:|ftp:)?//[^\\s]+|(?<![a-z0-9@.-])www\\.|(?<![a-z0-9@.-])[a-z0-9][a-z0-9-]*\\.(?:${TLD})(?![a-z0-9])`);
+const COMMON_TLD = 'com|nl|de|net|org|tk|ml|ga|cf|gq|xyz|top|info|biz|io|me|co|eu|be|app|link|click|online|site|shop|store|live|icu|ru|cn|pw|cc|ws|to|ly|gl|tr|uk|fr|es|it|pl|dev|ai|gg|pro|at|ch|vip|cloud';
+const SCHEME = '(?:https?:|ftp:)?//[^\\s]+';
+const WWW = '(?<![a-z0-9@.-])www\\.';
+/** A written domain: any label followed by an alphabetic TLD of 2+ letters. "bijv.", "o.a." and "149.50" are not. */
+const URL_OPEN = new RegExp(`${SCHEME}|${WWW}|(?<![a-z0-9@.-])[a-z0-9][a-z0-9-]*\\.[a-z]{2,}(?![a-z0-9])`);
+/** Spelled out ("evil punt tk"): the word "punt" is ordinary Dutch, so only common TLDs count there. */
+const URL_SPELLED = new RegExp(`${SCHEME}|${WWW}|(?<![a-z0-9@.-])[a-z0-9][a-z0-9-]*\\.(?:${COMMON_TLD})(?![a-z0-9])`);
 
 function hasUrl(normalized: string): boolean {
-  if (URL_RE.test(normalized)) return true;
+  if (URL_OPEN.test(normalized.replace(/·/g, '.'))) return true;
   const spelled = normalized
-    .replace(/[([{]\s*(?:dot|punt|\.)\s*[)\]}]|(?<![a-z])(?:dot|punt)(?![a-z])/g, '.')
-    .replace(/\s*\.\s*/g, '.');
-  return URL_RE.test(spelled);
+    .replace(/\s*(?:[([{]\s*(?:dot|punt|\.)\s*[)\]}]|(?<![a-z])(?:dot|punt)(?![a-z]))\s*/g, '.')
+    .replace(/·/g, '.');
+  return URL_SPELLED.test(spelled);
 }
 
-const PAYMENT = /betaal|betalen|overmaken|overboeken|stort |storten|tikkie|payconiq|pay now|pay at|payment|betaallink|bitcoin|crypto|gift ?card|cadeaubon|western union|wire transfer|rekeningnummer|bankrekening|bank account|zahlen|zahlung|[uü]berweis|\bode\b|[oö]deme|havale|\bpaypal\b|\bidea?l\b/;
+const PAYMENT = /betaal|betalen|overmaken|overboeken|stort |storten|tikkie|payconiq|pay now|pay at|payment|betaallink|bitcoin|crypto|gift ?card|cadeaubon|western union|wire transfer|rekeningnummer|bankrekening|bank account|zahlen|zahlung|[uü]berweis|\bode\b|[oö]deme|[oö]deyin|havale|contant|afrekenen|overschrijv|\bpaypal\b|\bidea?l\b/;
 
 // --- verdicts ------------------------------------------------------------------
 
-const ORDER: Finding[] = ['secret', 'iban', 'phone', 'email', 'url', 'plate', 'payment'];
+const ORDER: Finding[] = ['secret', 'iban', 'phone', 'email', 'plate', 'url', 'payment'];
 
 /** The first rule a text breaks (among `kinds`, default all), or null. */
 export function findSensitive(text: string, kinds: readonly Finding[] = ORDER): Finding | null {

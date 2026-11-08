@@ -421,8 +421,9 @@ d = await draft('Zeven E');
 assert.equal((await decide({ ...d, hash: sha256('Zeven E!') }, ASSISTANT, 'assistant')).status, 409);
 // Refusals are logged by reason, never with a number
 assert.ok(refusals().length >= 8);
-assert.equal(JSON.stringify(refusals()).includes('0699'), false);
-assert.equal(JSON.stringify(refusals()).includes('+31'), false);
+// a phone number, not any four digits that a random id happens to contain
+const PHONE_SHAPE = /(?<![0-9a-f-])(?:\+31|0031|0)6\d{8}(?!\d)|\+\d{9,}/;
+assert.equal(PHONE_SHAPE.test(JSON.stringify(refusals())), false, 'refusal events hold no phone number');
 // Only the approvals above exist
 assert.equal(rows("job_approvals").length - approvalsBefore, 3);
 
@@ -592,7 +593,7 @@ assert.ok(((sm.body.oldest as Row[])[0].waitingMinutes as number) >= 39);
   assert.equal(row.status, 'recorded', 'the caller cannot set the status');
   assert.equal(String(row.body).includes('sk-proj'), false, 'a key is never stored');
   await recordEvent(db, { ...base, eventKey: 'k1' });
-  await recordEvent(db, { ...base, actor: 'intake', eventKey: 'k1' });
+  await recordEvent(db, { ...base, actor: 'intake', direction: 'out', eventKey: 'k1' });
   assert.deepEqual(rows('job_events').filter((e) => String(e.event_key).endsWith(':k1')).map((e) => e.event_key).sort(), ['intake:k1', 'transport:k1']);
 }
 

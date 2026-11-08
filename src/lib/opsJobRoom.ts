@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { checkOps, logOps } from './opsAuth.ts';
-import { guardText, maskSecrets, type Audience, type Finding } from './jobRoomGuard.ts';
+import { findSensitive, guardText, maskSecrets, type Audience, type Finding } from './jobRoomGuard.ts';
 import { DESKS, heartbeatStatus } from './jobRoomLive.ts';
 import { toE164NL } from './phone.ts';
 
@@ -321,10 +321,32 @@ const roomBody = (r: Row, created: boolean) => ({
 const CHANNELS = ['whatsapp', 'telegram', 'crm', 'voice', 'system'] as const;
 const DIRECTIONS = ['in', 'out', 'internal'] as const;
 
+/**
+ * Event meta is for ids and codes. Keep at most 20 flat keys with short values,
+ * mask keys-like strings, and drop any value that carries a phone number, email,
+ * bank number or plate, so meta cannot be used to smuggle contact details.
+ */
+export function cleanMeta(meta: unknown): Row {
+  if (!isObject(meta)) return {};
+  const out: Row = {};
+  for (const [k, v] of Object.entries(meta).slice(0, 20)) {
+    if (!/^[a-z][a-z0-9_]{0,39}$/.test(k)) continue;
+    if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+    else if (typeof v === 'boolean') out[k] = v;
+    else if (typeof v === 'string') {
+      const masked = maskSecrets(v).slice(0, 200);
+      out[k] = findSensitive(masked, ['phone', 'email', 'iban', 'plate']) ? '[verwijderd]' : masked;
+    }
+  }
+  return out;
+}
+
 /** Who may write events through the route. Internal refusal and block events are written by this module only. */
 const EVENT_ACTORS = ['transport', 'wacli', 'intake', 'translator', 'quote-relay', 'dispatcher', 'invoice', 'reports', 'doctor', 'crm'] as const;
 const EVENT_KIND = /^[a-z][a-z0-9._-]{1,59}$/;
-const RESERVED_KIND = /^(approval|outbox|heartbeat)\./;
+const RESERVED_KIND = /^(approval|outbox|heartbeat|privacy)\./;
+/** Only the transport reports what customers wrote; every other actor may write `out` and `internal` rows. */
+const INBOUND_ACTORS = new Set(['transport', 'wacli']);
 const PROVIDER_ID = /^[\w.:@=+/-]{1,200}$/;
 
 /**
@@ -340,6 +362,7 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
   const actor = oneOf(raw.actor, EVENT_ACTORS);
   const kind = typeof raw.kind === 'string' && EVENT_KIND.test(raw.kind) && !RESERVED_KIND.test(raw.kind) ? raw.kind : null;
   if (!direction || !channel || !actor || !kind) return bad('Ongeldige gebeurtenis');
+  if (direction === 'in' && !INBOUND_ACTORS.has(actor)) return bad('Alleen het transport meldt inkomende berichten', 403);
   if (raw.jobRoomId !== undefined && raw.jobRoomId !== null && !isUuid(raw.jobRoomId)) {
     return bad('Ongeldige klus');
   }
@@ -362,7 +385,7 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
     // Scoped per source, so one caller cannot block another's keys.
     event_key: eventKey ? `${actor}:${eventKey}` : null,
     body,
-    meta: isObject(raw.meta) ? raw.meta : {},
+    meta: cleanMeta(raw.meta),
     status: 'recorded',
   };
   const ins = await supabase.from('job_events').insert(row).select('id').single();
@@ -379,7 +402,7 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
  * Tier 0 is sent without a person's approval, so the text is never the caller's:
  * each kind has one fixed text on the server, and a body that differs is refused.
  */
-export const TIER0_TEMPLATES: Record<string, string> = {
+export const TIER0_TEMPLATES: Record<string, string> = Object.assign(Object.create(null) as Record<string, string>, {
   ack: 'Wij hebben uw bericht ontvangen. Een medewerker reageert zo snel mogelijk.',
   on_my_way: 'De monteur is onderweg naar u.',
   review_request: 'Bedankt voor uw vertrouwen in Autosleutel24. Wilt u ons een korte review geven? Wij sturen u daar zo meer over.',
@@ -387,7 +410,17 @@ export const TIER0_TEMPLATES: Record<string, string> = {
   intake_q_location: 'Op welke locatie staat uw auto?',
   intake_q_keys: 'Bent u alle sleutels kwijt, of heeft u nog een reservesleutel?',
   intake_q_photo: 'Kunt u een foto van uw sleutel sturen, als u die nog heeft?',
-};
+});
+
+/**
+ * When a tier 0 text may go out without a person: the intake and acknowledgement texts only as a
+ * reply (the customer wrote first); "on my way" and the review request only in the job states they belong to.
+ */
+const TIER0_RULES: Record<string, { reply?: true; states?: string[] }> = Object.assign(Object.create(null), {
+  ack: { reply: true }, intake_q_plate: { reply: true }, intake_q_location: { reply: true }, intake_q_keys: { reply: true }, intake_q_photo: { reply: true },
+  on_my_way: { states: ['awarded', 'scheduled'] },
+  review_request: { states: ['done', 'invoiced', 'closed'] },
+});
 const GENERIC_KIND = /^[a-z][a-z0-9._-]{0,79}$/;
 
 type OutboxInput = {
@@ -479,8 +512,9 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
 
   let body: string | null;
   if (tier === 0) {
+    // own keys only: 'constructor' and '__proto__' are kinds a caller can type, not templates
+    if (!Object.hasOwn(TIER0_TEMPLATES, kind)) return bad('Tier 0 niet toegestaan voor deze soort', 422);
     const template = TIER0_TEMPLATES[kind];
-    if (!template) return bad('Tier 0 niet toegestaan voor deze soort', 422);
     if (raw.body !== undefined && raw.body !== null && clean(raw.body, 4000) !== template) return bad('Tier 0 heeft een vaste tekst', 422);
     body = template;
   } else {
@@ -488,7 +522,7 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
   }
   if (!body) return bad('Ongeldig bericht');
 
-  const room = await supabase.from('job_rooms').select('id, customer_contact_id').eq('id', raw.jobRoomId).maybeSingle();
+  const room = await supabase.from('job_rooms').select('id, customer_contact_id, state').eq('id', raw.jobRoomId).maybeSingle();
   if (room.error) return bad('Ophalen mislukt', 500);
   if (!room.data) return bad('Klus niet gevonden', 404);
   const contact = await supabase.from('contacts').select('id, role, active').eq('id', raw.contactId).maybeSingle();
@@ -505,6 +539,7 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
       .eq('job_room_id', raw.jobRoomId)
       .eq('contact_id', raw.contactId)
       .eq('direction', 'in')
+      .in('actor', ['transport', 'wacli'])
       .order('created_at', { ascending: false })
       .limit(20);
     const wroteFirst = (inbound.data ?? []).some((e: Row) => Date.now() - Date.parse(String(e.created_at)) < 24 * 3_600_000);
@@ -516,7 +551,12 @@ export async function proposeOutbox(supabase: SupabaseClient, raw: unknown): Pro
     if (!(await approverRowFor(supabase, raw.contactId, role))) return bad('Geen intern contact', 403);
     audience = 'internal';
   }
-  if (tier === 0 && audience !== 'customer_reply' && audience !== 'self_started') return bad('Tier 0 is alleen voor klanten', 422);
+  if (tier === 0) {
+    const rule = TIER0_RULES[kind];
+    if (role !== 'customer') return bad('Tier 0 is alleen voor klanten', 422);
+    const stateOk = rule.states?.includes(String(room.data.state));
+    if (!(rule.reply && audience === 'customer_reply') && !stateOk) return bad('Tier 0 niet toegestaan in deze situatie', 422);
+  }
 
   return insertOutbox(supabase, { jobRoomId: raw.jobRoomId, contactId: raw.contactId, audience, kind, tier, body });
 }
@@ -1074,6 +1114,19 @@ async function invoiceSnapshot(
 const isSnapshot = (v: Snapshot | Result): v is Snapshot => 'hash' in v;
 
 /**
+ * The customer chose their own display name (it comes from WhatsApp), and the
+ * invoice text is exempt from the payment rule, so the name must be a name:
+ * letters, spaces, hyphen and apostrophe, at most 40 characters, and not
+ * something that reads as a link, address or payment request.
+ */
+export function safeGreetingName(raw: string): string | null {
+  if (guardText(raw, 'customer_reply') !== null) return null;
+  const name = raw.normalize('NFKC').replace(/[^\p{L} '’-]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 40).trim();
+  if (name.length < 2 || /^klant$/i.test(name)) return null;
+  return guardText(name, 'customer_reply') === null ? name : null;
+}
+
+/**
  * POST: propose sending one invoice to the customer of a job room. It goes
  * through the outbox as a tier 2 row (a person approves it), never straight to
  * the customer, and only this function may set the invoice tier and attachment.
@@ -1112,8 +1165,8 @@ export async function proposeInvoice(supabase: SupabaseClient, raw: unknown): Pr
   if (!(snap.total > 0)) return bad('Factuur heeft geen bedrag', 409);
   if (!room.data.job_id || snap.jobId !== room.data.job_id) return bad('Factuur hoort niet bij deze klus', 409);
 
-  const name = String(contact.data.display_name);
-  const greeting = /^klant \d{4}$/i.test(name) ? 'Beste klant' : `Beste ${name}`;
+  const name = safeGreetingName(String(contact.data.display_name));
+  const greeting = name ? `Beste ${name}` : 'Beste klant';
   const body = `${greeting}, hierbij de factuur ${snap.invoiceNumber} van Autosleutel24, totaal € ${euro(snap.total)}. Betalen kan binnen 14 dagen. Bedankt!`;
 
   return insertOutbox(supabase, {

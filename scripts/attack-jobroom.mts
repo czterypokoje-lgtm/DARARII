@@ -117,6 +117,8 @@ async function world(jitter = false) {
 const W = await world();
 const OWNER = '0600000099';
 const ASST = '0600000098';
+// the customer wrote first in this job (the transport reported it): replies and tier-0 texts are allowed
+await recordEvent(W.db, { direction: 'in', channel: 'whatsapp', actor: 'transport', kind: 'message', jobRoomId: W.room, contactId: W.customer, providerMessageId: 'wamid.FIRSTW', body: 'Hallo' });
 
 // ---------------------------------------------------------------------------
 // C. Audience, kind and attachment spoofing
@@ -336,7 +338,7 @@ await expect('event cannot claim a status or an id', async () => {
 });
 await expect('event keys are scoped per actor', async () => {
   assert.equal((await recordEvent(W.db, ev({ eventKey: 'same' }))).status, 201);
-  assert.equal((await recordEvent(W.db, ev({ eventKey: 'same', actor: 'intake' }))).status, 201);
+  assert.equal((await recordEvent(W.db, ev({ eventKey: 'same', actor: 'intake', direction: 'out' }))).status, 201);
   assert.deepEqual((await recordEvent(W.db, ev({ eventKey: 'same' }))).body, { duplicate: true });
 });
 await expect('a key in event text is never stored', async () => {
@@ -502,6 +504,8 @@ for (const [n, fmt, plate] of SIDECODES) {
     ['zero-width', plate.replace(/-/g, '-​')], ['in a sentence', `Het kenteken ${plate.toLowerCase()} staat bij de garage`],
   ];
   for (const [how, text] of forms) {
+    // "1234GB" is a postcode as much as a plate; quotes are full of postcodes, so that one shape is deliberately let through
+    if (n === 2 && how.startsWith('no hyphens')) continue;
     await expect(`sidecode ${n} (${fmt}) ${how}: ${JSON.stringify(text)}`, () => assert.equal(guardText(text, 'technician'), 'plate'));
   }
 }
@@ -525,7 +529,7 @@ await expect('every tier-0 template passes the full guard', () => {
   for (const [kind, text] of Object.entries(TIER0_TEMPLATES)) assert.equal(guardText(text, 'customer_reply'), null, kind);
 });
 await expect('tier 0 sends only the template, for customers only', async () => {
-  for (const kind of Object.keys(TIER0_TEMPLATES)) {
+  for (const kind of Object.keys(TIER0_TEMPLATES).filter((k) => k !== 'on_my_way' && k !== 'review_request')) {
     const r = await proposeOutbox(W.db, { jobRoomId: W.room, contactId: W.customer, tier: 0, kind });
     assert.ok(r.status === 201 || r.body.duplicate === true, kind);
     assert.equal(W.rows('job_outbox').find((o) => o.id === r.body.outboxId)!.body, TIER0_TEMPLATES[kind]);
@@ -655,6 +659,131 @@ await expect('mint: refuses a changed row, a decided row, no owner, bad input; n
   const route = (await import('node:fs')).readFileSync('src/app/api/admin/jobroom/approval-token/route.ts', 'utf8');
   assert.match(route, /user\.role !== 'owner'/, 'the route needs the owner session');
   assert.match(route, /JOBROOM_MINT_ENABLED === 'on'/, 'and is off unless switched on');
+});
+
+
+// ---------------------------------------------------------------------------
+// J. Third review: guard residuals
+// ---------------------------------------------------------------------------
+const SPELLED = [
+  'nul zes drieëntwintig vijfenveertig zevenenzestig negenentachtig', 'nul zes tweeëntwintig vijf en veertig zeven en zestig negen en tachtig',
+  'nul zes tweeëndertig drie en twintig vier en veertig zeven en zestig', 'nul zes drie en twintig vijf en veertig zeven en zestig negen en tachtig',
+  'null sechs dreiundzwanzig fünfundvierzig siebenundsechzig achtundachtzig', 'nul zes DRIEËNTWINTIG VIJFENVEERTIG ZEVENENZESTIG NEGENENTACHTIG',
+  'sıfır altı yirmi üç kırk beş altmış yedi seksen dokuz', 'zero six twenty three forty five sixty seven',
+];
+for (const t of SPELLED) await expect(`spelled number: ${t}`, () => assert.equal(guardText(`Bel ${t}`, 'technician'), 'phone'));
+
+// Real Dutch quote text that must NEVER be blocked
+const QUOTE_OK = [
+  'Beste Jan, uw offerte voor een reservesleutel Volkswagen Golf (2018): € 149,50 incl. btw. Voorrijkosten € 12,50. De monteur is er tussen 14:00 en 16:00 op 08-11-2026. Adres: Dorpsstraat 12a, 3511 AB Utrecht. Referentie J-418.',
+  'Uw sleutel kost € 1.149,50 inclusief 21% btw en voorrijkosten.', 'Totaal 149,50 euro, contant of per pin is hier niet mogelijk', // see below: "contant" is a payment word
+  'We komen op 8 november 2026 om 14.30 uur', 'De auto is van 2018 (bouwjaar 2018), kenteken volgt', 'Postcode 3511AB, huisnummer 12 bis', 'Uw klus J418 staat gepland', 'Postcode 3511AB Utrecht, of 1011 AB Amsterdam, 9711GB Groningen',
+  'Referentie J 418 en A7', 'Binnen 30 tot 45 minuten, tarief 60-90 euro', 'Het kost vijf en veertig euro voor drie sleutels en twee afstandsbedieningen',
+  'De monteur belt u zo, uw klus is nummer 12 van vandaag', 'Dhr. Jansen, bijv. voor de Golf, o.a. een reservesleutel, d.w.z. een kopie, t.a.v. de eigenaar, m.b.t. uw aanvraag, z.s.m., enz.',
+  'Wij zijn bereikbaar van 08:00-22:00, 7 dagen per week, 365 dagen per jaar', 'Tussen 09.00 en 12.00 uur op 12-03-2026', 'Uw afspraak is op 2026-11-08 tussen 09:00 en 12:00',
+  'Bouwjaar 2015, 1.6 TDI, 77 kW, 105 pk', 'Aanbetaling is niet nodig', 'Sleutelnummer 1234567 staat op de sleutel', 'Het gaat om 3 sleutels en 1 afstandsbediening, samen 2 uur werk',
+  'Ik ben er om 3 uur, dus over 15 minuten, en ik duur 20 minuten', 'Prijs: € 89,95 + € 12,50 voorrijkosten = € 102,45', 'Tot straks!', 'Hoi, mijn sleutel is kwijt in Utrecht. Kunt u helpen?',
+];
+for (const t of QUOTE_OK) {
+  const payment = /contant/.test(t);
+  await expect(`real Dutch text passes: ${t.slice(0, 50)}`, () => assert.equal(guardText(t, 'customer_reply'), payment ? 'payment' : null, t));
+}
+
+const OPEN_TLDS = ['evil.dev', 'evil.ai', 'evil.gg', 'evil.pro', 'evil.at', 'evil.ch', 'evil.vip', 'evil.cloud', 'evil.zip', 'evil.mov', 'evil.lol', 'evil。tk', 'evil·tk', 'evil.tk/pay', 'EVIL.QQ'];
+for (const t of OPEN_TLDS) await expect(`open TLD: ${t}`, () => assert.notEqual(guardText(`Ga naar ${t}`, 'customer_reply'), null));
+const IBAN_FORMS = ['NL91  ABNA  0417  1643  00', 'NL91,ABNA,0417,1643,00', 'NL91/ABNA/0417/1643/00', 'NL91 ABNA / 0417 - 1643 . 00', 'NL91 АBNA 0417 1643 00', 'ΝL91 ABNA 0417 1643 00', 'NL91 ABNA 0417 1643 0O'.replace('0O', '00'), 'DE89 3704 0044 0532 0130 00'];
+for (const t of IBAN_FORMS) await expect(`IBAN form: ${t}`, () => assert.equal(guardText(`Rekening ${t}`, 'customer_reply'), 'iban'));
+for (const t of ['Wij verzoeken contant afrekenen', 'U kunt overschrijven naar ons', 'Lütfen ödeyin', 'Bitte bar zahlen']) {
+  await expect(`payment words: ${t}`, () => assert.equal(guardText(t, 'customer_reply'), 'payment'));
+}
+await expect('ordinary sentence boundaries are not domains', () => {
+  for (const t of ['Bedankt. Tot zo. Groet', 'Dit is punt een van de lijst', 'Op dit punt kunnen wij niets doen', 'Het was 149.50 euro']) assert.equal(guardText(t, 'customer_reply'), null, t);
+});
+
+// Prototype keys are never templates, kinds or roles
+await expect('prototype-chain keys never reach a template and never throw', async () => {
+  for (const kind of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', 'prototype']) {
+    for (const tier of [0, 1]) {
+      const r = await proposeOutbox(W.db, { jobRoomId: W.room, contactId: W.customer, tier, kind, body: tier ? 'Tekst' : undefined });
+      assert.ok(r.status < 500, `${kind} tier ${tier}: ${r.status}`);
+      if (tier === 0) assert.ok(r.status === 422 || r.status === 400, `${kind}: ${r.status}`);
+    }
+  }
+  for (const role of ['constructor', '__proto__', 'toString']) {
+    assert.ok((await addParty(W.db, { jobRoomId: W.room, contactId: W.tech, role })).status < 500, role);
+    assert.ok((await saveContact(W.db, { phone: '0600000141', name: 'X', role })).status < 500, role);
+  }
+  assert.equal(Object.getPrototypeOf(TIER0_TEMPLATES), null);
+});
+
+
+// ---------------------------------------------------------------------------
+// K. Third review: tier 0 situations, events, meta, invoice name
+// ---------------------------------------------------------------------------
+await expect('tier 0 only as a reply, or in the job state it belongs to', async () => {
+  const w = await world();
+  const t0 = (kind: string, contactId = w.customer) => proposeOutbox(w.db, { jobRoomId: w.room, contactId, tier: 0, kind });
+  // the customer has NOT written first: nothing at tier 0 that is a reply
+  for (const kind of ['ack', 'intake_q_plate', 'intake_q_location', 'intake_q_keys', 'intake_q_photo']) assert.equal((await t0(kind)).status, 422, `${kind} before the customer wrote`);
+  assert.equal((await t0('on_my_way')).status, 422, 'on_my_way before the job is awarded');
+  assert.equal((await t0('review_request')).status, 422, 'review request before the job is done');
+  const room = w.rows('job_rooms').find((r) => r.id === w.room)!;
+  room.state = 'scheduled';
+  assert.equal((await t0('on_my_way')).status, 201, 'on_my_way once scheduled');
+  assert.equal((await t0('review_request')).status, 422, 'still not a review request');
+  room.state = 'done';
+  assert.equal((await t0('review_request')).status, 201, 'review request after done');
+  assert.equal(w.rows('job_outbox').find((o) => o.kind === 'review_request')!.audience, 'self_started', 'it is a message we start ourselves');
+  assert.equal((await t0('on_my_way')).status, 422, 'on_my_way after done');
+  await recordEvent(w.db, { direction: 'in', channel: 'whatsapp', actor: 'transport', kind: 'message', jobRoomId: w.room, contactId: w.customer, providerMessageId: 'wamid.T0', body: 'Hallo' });
+  assert.equal((await t0('ack')).status, 201, 'ack once the customer wrote');
+  assert.equal((await t0('ack', w.tech)).status, 422, 'never to technicians');
+});
+await expect('the ops token cannot forge "customer wrote first"', async () => {
+  const w = await world();
+  for (const actor of ['intake', 'dispatcher', 'crm', 'translator', 'evil']) {
+    const r = await recordEvent(w.db, { direction: 'in', channel: 'whatsapp', actor, kind: 'message', jobRoomId: w.room, contactId: w.customer, providerMessageId: `wamid.F${actor}` });
+    assert.ok(r.status === 400 || r.status === 403, `${actor}: ${r.status}`);
+  }
+  const r = await w.propose('Eerste bericht');
+  assert.equal(w.rows('job_outbox').find((o) => o.id === r.body.outboxId)!.audience, 'self_started');
+  // a forged row that got in anyway (wrong actor) does not count
+  w.rows('job_events').push({ id: randomUUID(), job_room_id: w.room, contact_id: w.customer, direction: 'in', actor: 'intake', created_at: new Date().toISOString() });
+  const r2 = await w.propose('Tweede bericht');
+  assert.equal(w.rows('job_outbox').find((o) => o.id === r2.body.outboxId)!.audience, 'self_started');
+});
+await expect('privacy.* and other reserved kinds cannot be written', async () => {
+  for (const kind of ['privacy.redacted', 'privacy.x', 'approval.refused', 'outbox.blocked', 'heartbeat.x']) {
+    assert.equal((await recordEvent(W.db, { direction: 'out', channel: 'system', actor: 'crm', kind })).status, 400, kind);
+  }
+});
+await expect('event meta carries no contact details or keys, and stays small', async () => {
+  const r = await recordEvent(W.db, ev({ meta: {
+    ok_number: 5, ok_flag: true, ok_text: 'volgorde 3', phone: '0612345678', mail: 'jan@example.com', plate: 'AB-123-C',
+    iban: 'NL91ABNA0417164300', key: 'sk-proj-abcdefghijklmnopqrstuvwx', nested: { a: 1 }, list: [1, 2], 'Bad Key': 'x', long: 'x'.repeat(500),
+  } }));
+  const meta = W.rows('job_events').find((e) => e.id === r.body.eventId)!.meta as Row;
+  assert.equal(meta.ok_number, 5);
+  assert.equal(meta.ok_flag, true);
+  assert.equal(meta.ok_text, 'volgorde 3');
+  for (const k of ['phone', 'mail', 'plate', 'iban']) assert.equal(meta[k], '[verwijderd]', k);
+  assert.equal(String(meta.key).includes('sk-proj'), false);
+  assert.equal('nested' in meta || 'list' in meta || 'Bad Key' in meta, false);
+  assert.equal(String(meta.long).length <= 200, true);
+  const many = await recordEvent(W.db, ev({ meta: Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`k${i}`, i])) }));
+  assert.equal(Object.keys(W.rows('job_events').find((e) => e.id === many.body.eventId)!.meta).length, 20);
+});
+await expect('the invoice greeting is a name, never contact details or a link', () => {
+  const { safeGreetingName } = J as unknown as { safeGreetingName: (s: string) => string | null };
+  assert.equal(safeGreetingName('Jan de Vries'), 'Jan de Vries');
+  assert.equal(safeGreetingName('Zeynep Çelik'), 'Zeynep Çelik');
+  assert.equal(safeGreetingName("Marie-Claire O'Brien"), "Marie-Claire O'Brien");
+  for (const bad of ['Jan 0612345678', 'http://evil.tk', 'evil.tk', 'Betaal nu naar NL91ABNA0417164300', 'jan@example.com', 'Pay now', 'Klant 0001', '1234', '', 'x', 'Jan​0612345678']) {
+    const n = safeGreetingName(bad);
+    assert.ok(n === null || /^[\p{L} '’-]+$/u.test(n), `${bad} -> ${n}`);
+    assert.equal(/0612|http|evil|NL91|@|pay/i.test(n ?? ''), false, `${bad} -> ${n}`);
+  }
+  assert.equal(safeGreetingName('a'.repeat(100) + ' b') === null || safeGreetingName('a'.repeat(100) + ' b')!.length <= 40, true);
 });
 
 // ---------------------------------------------------------------------------

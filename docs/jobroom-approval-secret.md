@@ -54,4 +54,20 @@ The log tables are append-only on purpose. A deletion request is honoured by bla
 select * from public.job_redact_contact_messages('<contact id>', 'avg-verzoek 2026-11');
 ```
 
-It blanks `body` (and `meta` for events) of that contact's events and of their finished outbox rows (sent, cancelled, failed), keeps ids, hashes, kinds and times, sets `redacted_at`, and writes one event `privacy.redacted` with counts and the reason code only. Waiting messages (proposed, approved) are not touched: cancel them first. The reason is a code, never personal data. Only the service role and the SQL editor can run it. Contact details themselves (name, number) live in `contacts` and are edited there. Deadline: within 30 days of the request (concepts brief).
+It blanks `body` (and `meta` for events) of that contact's events, of events without a contact id that belong to their own jobs, and of their finished outbox rows (sent, cancelled, failed). It keeps ids, hashes, kinds and times, sets `redacted_at`, and writes one event `privacy.redacted` with counts and the reason code only. Evidence events (`outbox.blocked`, `approval.refused`, `privacy.redacted`: ids, hashes and reason codes) are never blanked. It also **anonymises the contact row** (name, WhatsApp name, city and number replaced, aliases removed, contact deactivated). It refuses owner, staff and approver contacts. Waiting messages (proposed, approved) are not touched: cancel them first. The reason is a code, never personal data. Only the service role and the SQL editor can run it. Deadline: within 30 days of the request (concepts brief).
+
+**Run it before anything else touches the contact.** A contact that has events can never be deleted (the log points at it, and 0084 refuses the delete with a clear message); after redaction the anonymised row simply stays.
+
+## Running the checks
+
+All checks are plain Node scripts (Node 24, no test runner, nothing added to `package.json`). From the CRM repo root:
+
+```bash
+node scripts/check-jobroom.mts      # handlers, on an in-memory fake database
+node scripts/check-joblive.mts      # live view logic and the stop alarm
+node scripts/attack-jobroom.mts     # attacks on the guard, approvals, events, tier 0, plus stress
+node scripts/check-jobroom-sql.mts  # migrations 0078 to 0084 on a throwaway Postgres (pglite)
+```
+
+`check-jobroom-sql.mts` needs `@electric-sql/pglite`. The first run installs it once (pinned to 0.2.17, with npm) into a folder in the system temp directory, so it needs network only that once; after that it runs offline. Set `PGLITE_DIR=<folder>` to use another folder, or `PGLITE_OFFLINE=1` to forbid the install (then it tells you the one command to run by hand: `npm install @electric-sql/pglite@0.2.17 --prefix <folder>`). The database is in memory and thrown away; nothing touches Supabase. The script runs the migrations twice, as the non-superuser roles `service_role` (bypasses RLS), `authenticated` and `anon`, with Supabase-style default grants (every new table granted to all three), and also runs the real handlers against that Postgres. Expected last line: `check-jobroom-sql: all passed (... checks, 7 migrations applied twice ...)`.
+

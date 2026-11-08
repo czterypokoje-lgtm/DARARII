@@ -1,24 +1,43 @@
 /**
  * SQL checks for migrations 0078 to 0082 on a throwaway, in-memory Postgres.
  *
- *   PGLITE_DIR=/path/to/folder/with/node_modules node scripts/check-jobroom-sql.mts
+ *   node scripts/check-jobroom-sql.mts
  *
- * PGLITE_DIR holds an install of @electric-sql/pglite (kept out of the repo's
- * dependencies on purpose). Nothing here touches a network service or the real
+ * The first run installs @electric-sql/pglite (pinned) into a temp folder, or into PGLITE_DIR if set
+ * (kept out of the repo's dependencies on purpose). Nothing here touches a network service or the real
  * Supabase project. The CRM tables the migrations point at (technicians, leads,
  * jobs) and crm_role() are stubbed; RLS roles are real Postgres roles.
  */
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as J from '../src/lib/opsJobRoom.ts';
 import { pgClient } from './lib/pgliteClient.mts';
 
-const dir = process.env.PGLITE_DIR;
-if (!dir) {
-  console.log('check-jobroom-sql: skipped (set PGLITE_DIR to a folder with @electric-sql/pglite installed)');
-  process.exit(0);
+/*
+ * Where pglite lives: PGLITE_DIR if set, else a folder in the system temp directory. If it is not
+ * installed there yet, it is installed there once (npm, version pinned): nothing is added to this
+ * repo's package.json. No network is needed after that. Set PGLITE_OFFLINE=1 to forbid the install.
+ */
+const dir = process.env.PGLITE_DIR ?? join(tmpdir(), 'jobroom-pglite');
+if (!existsSync(join(dir, 'node_modules', '@electric-sql', 'pglite'))) {
+  if (process.env.PGLITE_OFFLINE) {
+    console.error(`check-jobroom-sql: pglite is not installed in ${dir}. Run: npm install @electric-sql/pglite@0.2.17 --prefix ${dir}`);
+    process.exit(1);
+  }
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'package.json'), '{"name":"jobroom-pglite","private":true}');
+  console.log(`check-jobroom-sql: installing @electric-sql/pglite@0.2.17 into ${dir} (once)`);
+  try {
+    execSync('npm install @electric-sql/pglite@0.2.17 --no-audit --no-fund --silent', { cwd: dir, stdio: 'inherit' });
+  } catch {
+    console.error(`check-jobroom-sql: the install failed. Run by hand: npm install @electric-sql/pglite@0.2.17 --prefix ${dir}`);
+    process.exit(1);
+  }
 }
 const require = createRequire(`${dir}/package.json`);
 const { PGlite } = require('@electric-sql/pglite') as { PGlite: new () => any };
@@ -57,11 +76,11 @@ await pg.exec(`
 
 // --- 1. all five migrations apply, in order, and apply again ---
 const files = [
-  '0078_job_room.sql', '0079_job_outbox_attachment.sql', '0080_job_approvers.sql', '0081_job_heartbeats.sql', '0082_job_room_hardening.sql', '0083_job_room_second_review.sql',
+  '0078_job_room.sql', '0079_job_outbox_attachment.sql', '0080_job_approvers.sql', '0081_job_heartbeats.sql', '0082_job_room_hardening.sql', '0083_job_room_second_review.sql', '0084_job_room_third_review.sql',
 ];
 for (const f of files) await pg.exec(readFileSync(`supabase/migrations/${f}`, 'utf8'));
 for (const f of files) await pg.exec(readFileSync(`supabase/migrations/${f}`, 'utf8'));
-ok(true, 'migrations 0078-0083 apply, and apply again (idempotent)');
+ok(true, 'migrations 0078-0084 apply, and apply again (idempotent)');
 
 // --- fixtures (owner and staff contacts need the SQL-only switch of 0083) ---
 await q(`select set_config('app.allow_staff_roles','on',false)`);
@@ -72,6 +91,7 @@ const owner = await contact('+31600000099', 'owner');
 const staff = await contact('+31600000098', 'staff');
 const room = (await rowsOf(`insert into job_rooms (customer_contact_id) values ($1) returning id, code`, [customer]))[0];
 ok(Number(room.code) === 1, 'job code starts at 1 (J-1)');
+await q(`insert into job_approvers (contact_id, role) values ($1,'owner')`, [owner]); // decisions must come from an active approver
 
 const outbox = async (over: Record<string, unknown> = {}) => {
   const r = { job_room_id: room.id, contact_id: customer, audience: 'customer_reply', kind: 'note', tier: 1, body: 'Hallo', text_hash: h64('a'), dedupe_key: randomUUID().replace(/-/g, '').padEnd(64, '0'), shadow: true, ...over };
@@ -121,7 +141,7 @@ checks += 5;
 
 // --- 6. approvals: the function is atomic, and the table is append-only ---
 const decide = (id: string, decision: string, hash: string) =>
-  rowsOf(`select * from job_decide_approval($1,$2,$3,'Owner Test','owner_tap')`, [id, decision, hash]);
+  rowsOf(`select * from job_decide_approval($1,$2,$3,$4,'owner_tap')`, [id, decision, hash, owner]);
 const o2 = await outbox({ body: 'Tweede', text_hash: h64('2') });
 await fails('wrong hash', `select * from job_decide_approval($1,'approved',$2,'x','owner_tap')`, [o2, h64('3')], /hash_changed/);
 await fails('unknown row', `select * from job_decide_approval($1,'approved',$2,'x','owner_tap')`, [randomUUID(), h64('2')], /not_found/);
@@ -131,7 +151,7 @@ ok((await rowsOf(`select count(*)::int as n from job_approvals where outbox_id =
 const r1 = await decide(o2, 'approved', h64('2'));
 ok(r1[0].new_state === 'approved' && Number(r1[0].code) >= 1, 'approve: state and code');
 const st = (await rowsOf(`select state, approved_by, approved_at from job_outbox where id = $1`, [o2]))[0];
-ok(st.state === 'approved' && st.approved_by === 'Owner Test' && st.approved_at, 'approve sets who and when');
+ok(st.state === 'approved' && st.approved_by === owner && st.approved_at, 'approve sets who and when');
 await fails('second decision', `select * from job_decide_approval($1,'approved',$2,'x','owner_tap')`, [o2, h64('2')], /already_decided/);
 const o4 = await outbox({ body: 'Derde', text_hash: h64('4') });
 await decide(o4, 'rejected', h64('4'));
@@ -146,7 +166,6 @@ checks += 6;
 await fails('owner approver on a customer contact', `insert into job_approvers (contact_id, role) values ($1,'owner')`, [customer], /does not match/i);
 await fails('assistant approver on a customer contact', `insert into job_approvers (contact_id, role) values ($1,'assistant')`, [customer], /does not match/i);
 await fails('assistant approver on an owner contact', `insert into job_approvers (contact_id, role) values ($1,'assistant')`, [owner], /does not match/i);
-await q(`insert into job_approvers (contact_id, role) values ($1,'owner')`, [owner]);
 await q(`insert into job_approvers (contact_id, role, audiences, max_tier) values ($1,'assistant','{customer_reply}',2)`, [staff]);
 await fails('an assistant row cannot be turned into an owner row', `update job_approvers set role = 'owner' where contact_id = $1`, [staff], /does not match/i);
 await fails('bad audience list', `insert into job_approvers (contact_id, role, audiences) values ($1,'assistant','{everyone}')`, [await contact('+31600000097', 'staff')], /check/i);
@@ -231,7 +250,7 @@ checks += 7;
 // --- 13. outbox state machine ---
 const decideRow = async (hash: string) => outbox({ body: `sm-${hash.slice(0, 4)}`, text_hash: hash, dedupe_key: hash });
 const approvalRow = (outboxId: string, decision: string, hash: string) =>
-  q(`insert into job_approvals (outbox_id, job_room_id, decision, text_hash, decided_by, decided_via) values ($1,$2,$3,$4,'x','owner_tap')`, [outboxId, room.id, decision, hash]);
+  q(`insert into job_approvals (outbox_id, job_room_id, decision, text_hash, decided_by, decided_via) values ($1,$2,$3,$4,$5,'owner_tap')`, [outboxId, room.id, decision, hash, owner]);
 await as('service_role', async () => {
   const sA = await decideRow(h64('a1'));
   await fails('approved without an approval row', `update job_outbox set state = 'approved' where id = $1`, [sA], /matching approved/);
@@ -412,4 +431,57 @@ await as('service_role', async () => {
   ok(sent.length === 1, '20 overlapping alarm checks: one alert');
 });
 
-console.log(`check-jobroom-sql: all passed (${checks} checks, 6 migrations applied twice on a throwaway Postgres)`);
+// --- 18. third review: approvals only from active approvers; evidence-keeping erasure; contact removal ---
+await as('service_role', async () => {
+  const mkRow = async (n: string) => outbox({ body: `third-${n}`, text_hash: h64(`3${n}`), dedupe_key: h64(`3${n}`) });
+  const byCustomer = await mkRow('a');
+  await q(`insert into job_approvals (outbox_id, job_room_id, decision, text_hash, decided_by, decided_via) values ($1,$2,'approved',$3,$4,'owner_tap')`, [byCustomer, room.id, h64('3a'), customer]);
+  await fails('an approval by a contact who is no approver does not count', `update job_outbox set state = 'approved' where id = $1`, [byCustomer], /active approver/);
+  const byName = await mkRow('b');
+  await q(`insert into job_approvals (outbox_id, job_room_id, decision, text_hash, decided_by, decided_via) values ($1,$2,'approved',$3,'Owner Test','owner_tap')`, [byName, room.id, h64('3b')]);
+  await fails('a display name is not an approver', `update job_outbox set state = 'approved' where id = $1`, [byName], /active approver/);
+  const byOff = await mkRow('c');
+  await q(`insert into job_approvals (outbox_id, job_room_id, decision, text_hash, decided_by, decided_via) values ($1,$2,'approved',$3,$4,'assistant')`, [byOff, room.id, h64('3c'), staff]);
+  await q(`update job_approvers set active = false where contact_id = $1`, [staff]);
+  await fails('a switched-off approver does not count', `update job_outbox set state = 'approved' where id = $1`, [byOff], /active approver/);
+  await q(`update job_approvers set active = true where contact_id = $1`, [staff]);
+  await q(`update job_outbox set state = 'approved' where id = $1`, [byOff]);
+  ok(true, 'the same approval counts once the approver is active');
+});
+// once shadow is lifted (a later migration), a decision by 'system' is not an approval either
+await q(`alter table job_outbox disable trigger job_outbox_immutable_trg`);
+const live = await outbox({ body: 'go-live probe', text_hash: h64('3d'), dedupe_key: h64('3d'), shadow: false });
+await q(`alter table job_outbox enable trigger job_outbox_immutable_trg`);
+await q(`insert into job_approvals (outbox_id, job_room_id, decision, text_hash, decided_by, decided_via) values ($1,$2,'approved',$3,$4,'system')`, [live, room.id, h64('3d'), owner]);
+await fails("a 'system' decision never approves a row that is not shadow", `update job_outbox set state = 'approved' where id = $1`, [live], /active approver/);
+
+// erasure keeps the evidence, refuses staff, anonymises, and the contact cannot be removed while it has events
+const v2 = await contact('+31600000401', 'customer', 'Tweede Wis');
+const v2Room = (await rowsOf(`insert into job_rooms (customer_contact_id) values ($1) returning id`, [v2]))[0].id;
+await q(`insert into job_events (job_room_id, contact_id, direction, channel, actor, kind, body) values ($1,$2,'in','whatsapp','transport','message','Tekst met 0612345678')`, [v2Room, v2]);
+await q(`insert into job_events (job_room_id, contact_id, direction, channel, actor, kind, body) values ($1,null,'in','whatsapp','transport','message','Zonder contact in dezelfde klus')`, [v2Room]);
+await q(`insert into job_events (job_room_id, contact_id, direction, channel, actor, kind, status, meta) values ($1,$2,'internal','system','jobroom-guard','outbox.blocked','blocked','{"reason":"phone"}')`, [v2Room, v2]);
+await q(`insert into job_events (job_room_id, direction, channel, actor, kind, status, meta) values ($1,'internal','system','jobroom-approval','approval.refused','blocked','{"reason":"not_approver"}')`, [v2Room]);
+await q(`insert into contact_aliases (contact_id, alias, alias_folded) values ($1,'Tweedje','tweedje')`, [v2]);
+await as('service_role', async () => {
+  await fails('a contact with events cannot be removed', `delete from contacts where id = $1`, [v2], /has events/);
+  await fails('the owner contact cannot be redacted', `select * from job_redact_contact_messages($1, 'avg-verzoek')`, [owner], /cannot be redacted/);
+  await fails('nor staff or an approver', `select * from job_redact_contact_messages($1, 'avg-verzoek')`, [staff], /cannot be redacted/);
+  await fails('an unknown contact', `select * from job_redact_contact_messages($1, 'avg-verzoek')`, [randomUUID()], /unknown contact/);
+  const r = await rowsOf(`select * from job_redact_contact_messages($1, 'avg-verzoek 2026-11')`, [v2]);
+  ok(Number(r[0].events_redacted) === 2, "the contact's event and the contact-less event of their job are redacted");
+});
+const kept = await rowsOf(`select kind, meta, body, redacted_at from job_events where job_room_id = $1 and kind in ('outbox.blocked','approval.refused')`, [v2Room]);
+ok(kept.length === 2 && kept.every((e) => !e.redacted_at && e.meta.reason), 'evidence events (guard and approval refusals) are kept as they were');
+ok((await rowsOf(`select count(*)::int as n from job_events where job_room_id = $1 and body = '[verwijderd]'`, [v2Room]))[0].n === 2, 'message texts blanked');
+const anon = (await rowsOf(`select display_name, wa_name, city, phone_e164, active from contacts where id = $1`, [v2]))[0];
+ok(anon.display_name === '[verwijderd]' && anon.wa_name === null && /^\+999\d{9}$/.test(anon.phone_e164) && anon.active === false, 'the contact is anonymised');
+ok((await rowsOf(`select count(*)::int as n from contact_aliases where contact_id = $1`, [v2]))[0].n === 0, 'and its aliases are gone');
+await as('service_role', async () => {
+  await fails('still not removable once anonymised (the log points at it)', `delete from contacts where id = $1`, [v2], /has events/);
+  const lonely = await contact('+31600000402', 'customer', 'Zonder events');
+  await q(`delete from contacts where id = $1`, [lonely]);
+  ok(true, 'a contact without events can be removed');
+});
+
+console.log(`check-jobroom-sql: all passed (${checks} checks, 7 migrations applied twice on a throwaway Postgres)`);
