@@ -289,7 +289,6 @@ export async function POST(request: Request) {
       quoted_price: total,
       notes: asText(body.notes, 500),
       customer_name: name,
-      customer_phone: phone,
     });
     for (const offer of plan.offers) {
       if (offer.opensAfter > 0) continue;

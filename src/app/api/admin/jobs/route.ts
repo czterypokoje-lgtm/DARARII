@@ -302,7 +302,7 @@ export async function POST(request: Request) {
    * it, so this is a "here's your job" notice, not a "here's an offer" one.
    */
   if (technicianId) {
-    const briefing = jobBriefing(row);
+    const briefing = jobBriefing(row, 'assigned');
     after(async () => {
       const { data: tech } = await supabase
         .from('technicians')
