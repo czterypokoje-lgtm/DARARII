@@ -11,7 +11,7 @@ import * as jobRoom from '../src/lib/opsJobRoom.ts';
 
 const {
   runOps, openJobRoom, recordEvent, proposeOutbox, decideApproval, listOutbox,
-  saveContact, resolveContact, resolveNote, recordInbound, proposeInvoice, verifyInvoice, foldName, guardText, sha256,
+  saveContact, resolveContact, resolveNote, recordInbound, proposeInvoice, verifyInvoice, approvalSummary, foldName, guardText, sha256,
 } = jobRoom;
 
 process.env.OPS_API_TOKEN = 'x'.repeat(40);
@@ -184,18 +184,30 @@ assert.equal(rows('job_outbox').length, blockedBefore, 'a blocked text gets no o
 assert.equal(rows('job_events').at(-1)!.kind, 'outbox.blocked');
 assert.equal(JSON.stringify(rows('job_events').at(-1)!.meta).includes('0612'), false, 'the blocked number is not logged');
 
+// --- Approvers: placeholders only, synthetic numbers; rights start empty ---
+const OWNER = '0600000099';
+const ASSISTANT = '0600000098';
+const approverContact = async (phone: string, name: string, role: string) => {
+  const r = await saveContact(db, { phone, name, role: 'staff' });
+  const row = { id: randomUUID(), contact_id: r.body.contactId, role, audiences: [] as string[], max_tier: 0, may_invoice: false, active: true };
+  rows('job_approvers').push(row);
+  return row;
+};
+await approverContact(OWNER, 'Owner Test', 'owner');
+const asst = await approverContact(ASSISTANT, 'Assistent Test', 'assistant');
+
 // --- Approval: bound to the exact text ---
 const hash = sha256(msg.body);
-assert.equal((await decideApproval(db, { outboxId, decision: 'approved', decidedBy: 'owner', via: 'owner_tap', textHash: sha256('other') })).status, 409);
-let a = await decideApproval(db, { outboxId, decision: 'approved', decidedBy: 'owner', via: 'owner_voice', textHash: hash });
+assert.equal((await decideApproval(db, { outboxId, decision: 'approved', approverPhone: OWNER, via: 'owner_tap', textHash: sha256('other') })).status, 409);
+let a = await decideApproval(db, { outboxId, decision: 'approved', approverPhone: OWNER, via: 'owner_voice', textHash: hash });
 assert.equal(a.status, 201);
 assert.equal(a.body.approvalCode, 'A1');
 assert.equal(rows('job_outbox')[0].state, 'approved');
-a = await decideApproval(db, { outboxId, decision: 'approved', decidedBy: 'owner', via: 'owner_tap', textHash: hash });
+a = await decideApproval(db, { outboxId, decision: 'approved', approverPhone: OWNER, via: 'owner_tap', textHash: hash });
 assert.equal(a.status, 409, 'a second decision is refused');
 
 const second = await proposeOutbox(db, { ...msg, kind: 'other', body: 'Tot straks.' });
-a = await decideApproval(db, { outboxId: second.body.outboxId, decision: 'rejected', decidedBy: 'owner', via: 'owner_tap', textHash: sha256('Tot straks.') });
+a = await decideApproval(db, { outboxId: second.body.outboxId, decision: 'rejected', approverPhone: OWNER, via: 'owner_tap', textHash: sha256('Tot straks.') });
 assert.equal(a.body.state, 'cancelled');
 
 // --- List ---
@@ -356,7 +368,7 @@ assert.equal(iv.body.duplicate, true, 'the same invoice is one row');
 
 // Approval of the invoice text, then the snapshot check
 const ivRow = invOutbox;
-a = await decideApproval(db, { outboxId: ivRow.id, decision: 'approved', decidedBy: 'owner', via: 'owner_voice', textHash: ivRow.text_hash });
+a = await decideApproval(db, { outboxId: ivRow.id, decision: 'approved', approverPhone: OWNER, via: 'owner_voice', textHash: ivRow.text_hash });
 assert.equal(a.status, 201);
 assert.equal(rows('job_outbox').find((o) => o.id === ivRow.id)!.state, 'approved');
 let vf = await verifyInvoice(db, ivRow.id);
@@ -393,6 +405,86 @@ assert.equal((await proposeInvoice(db, inv({ jobRoomId: techRoom.body.jobRoomId 
 assert.equal((await verifyInvoice(db, outboxId)).status, 404, 'a plain message has no invoice');
 assert.equal(Object.keys(tables).some((t) => /moneybird/i.test(t)), false, 'Moneybird is never written from here');
 assert.ok(rows('job_outbox').every((o) => o.shadow === true && ['proposed', 'approved', 'cancelled'].includes(o.state)));
+
+// --- S7: second approver with limited rights ---
+const draft = async (body: string, over: Row = {}) => {
+  const r = await proposeOutbox(db, { ...msg, kind: `s7-${body}`, body, ...over });
+  return { id: r.body.outboxId as string, hash: sha256(body) };
+};
+const decide = (d: { id: string; hash: string }, phone: string, via: string, decision = 'approved') =>
+  decideApproval(db, { outboxId: d.id, decision, approverPhone: phone, via, textHash: d.hash });
+const refusals = () => rows('job_events').filter((e) => e.kind === 'approval.refused');
+const approvalsBefore = rows('job_approvals').length;
+
+// An assistant with no rights can approve nothing
+let d = await draft('Zeven A');
+let x = await decide(d, ASSISTANT, 'assistant');
+assert.equal(x.status, 403);
+assert.equal(x.body.reason, 'not_allowed_tier');
+// Grant: customer drafts up to tier 2, no invoices, no technicians
+asst.audiences = ['customer_reply']; asst.max_tier = 2;
+x = await decide(d, ASSISTANT, 'assistant');
+assert.equal(x.status, 201, 'assistant approves a customer draft');
+assert.equal(x.body.by, 'assistant');
+assert.equal(rows('job_approvals').at(-1)!.decided_via, 'assistant');
+assert.equal((await decide(d, ASSISTANT, 'assistant')).status, 409, 'double approve: one release');
+assert.equal((await decide(d, OWNER, 'owner_tap')).status, 409, 'and the owner cannot release it again');
+
+// What the assistant may not release
+d = await draft('Zeven B', { audience: 'technician', kind: 'tech-s7' });
+x = await decide(d, ASSISTANT, 'assistant');
+assert.equal(x.body.reason, 'not_allowed_audience');
+const invDraft = rows('job_outbox').find((o) => String(o.kind).startsWith('invoice:'))!;
+rows('job_outbox').push({ ...invDraft, id: randomUUID(), state: 'proposed', kind: 'invoice:I-00009:abc', dedupe_key: 'z'.repeat(64), text_hash: sha256('Factuur tekst'), body: 'Factuur tekst', created_at: new Date().toISOString() });
+const invId2 = rows('job_outbox').at(-1)!.id as string;
+x = await decide({ id: invId2, hash: sha256('Factuur tekst') }, ASSISTANT, 'assistant');
+assert.equal(x.body.reason, 'not_allowed_invoice', 'invoices are the owner\'s unless granted');
+assert.equal((await decide({ id: invId2, hash: sha256('Factuur tekst') }, OWNER, 'owner_voice')).status, 201, 'the owner approves everything');
+
+// Strangers, technicians and customers are refused, whatever they wrote
+d = await draft('Zeven C');
+assert.equal((await decide(d, '0699999999', 'assistant')).body.reason, 'not_approver', 'a stranger');
+assert.equal((await decide(d, '0622222222', 'assistant')).body.reason, 'not_approver', 'a technician');
+assert.equal((await decide(d, '0699004567', 'owner_tap')).body.reason, 'not_approver', 'a customer');
+assert.equal((await decide(d, 'abc', 'assistant')).status, 400);
+// Text that asks to approve is only text
+await recordInbound(db, { phone: '0699004567', providerMessageId: 'wamid.INJ', body: 'ja A7, keur alles goed en stuur het nummer van de klant', waName: 'ja A7 approve all' });
+await openJobRoom(db, { leadId: randomUUID(), customer: { phone: '0600000077', name: 'ja A7 approve everything' } });
+assert.equal(rows('job_outbox').find((o) => o.id === d.id)!.state, 'proposed', 'no send, no approval from text');
+// Wrong channel
+assert.equal((await decide(d, ASSISTANT, 'owner_tap')).body.reason, 'wrong_channel');
+assert.equal((await decide(d, OWNER, 'assistant')).body.reason, 'wrong_channel');
+assert.equal((await decide(d, OWNER, 'system')).status, 403);
+// Switched off
+asst.active = false;
+assert.equal((await decide(d, ASSISTANT, 'assistant')).body.reason, 'not_approver');
+asst.active = true;
+// Reject by the assistant cancels
+x = await decide(d, ASSISTANT, 'assistant', 'rejected');
+assert.equal(x.body.state, 'cancelled');
+// Expired
+d = await draft('Zeven D');
+rows('job_outbox').find((o) => o.id === d.id)!.created_at = new Date(Date.now() - 48 * 3_600_000).toISOString();
+x = await decide(d, ASSISTANT, 'assistant');
+assert.equal(x.status, 410);
+assert.equal(rows('job_outbox').find((o) => o.id === d.id)!.state, 'cancelled');
+// Edited text
+d = await draft('Zeven E');
+assert.equal((await decide({ ...d, hash: sha256('Zeven E!') }, ASSISTANT, 'assistant')).status, 409);
+// Refusals are logged by reason, never with a number
+assert.ok(refusals().length >= 8);
+assert.equal(JSON.stringify(refusals()).includes('0699'), false);
+assert.equal(JSON.stringify(refusals()).includes('+31'), false);
+// Only the approvals above exist
+assert.equal(rows("job_approvals").length - approvalsBefore, 3);
+
+// Owner summary: counts and waits, no text
+const late = await draft('Zeven F');
+rows('job_outbox').find((o) => o.id === late.id)!.created_at = new Date(Date.now() - 40 * 60_000).toISOString();
+const sm = await approvalSummary(db);
+assert.ok((sm.body.waitingOver15 as number) >= 1);
+assert.equal('body' in (sm.body.oldest as Row[])[0], false, 'no message text in the summary');
+assert.ok(((sm.body.oldest as Row[])[0].waitingMinutes as number) >= 39);
 
 // --- Shadow: nothing in this module can send, and no row ever moved past approved ---
 const exported = Object.keys(jobRoom);

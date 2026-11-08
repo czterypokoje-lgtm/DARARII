@@ -436,28 +436,98 @@ export async function listOutbox(
   return ok({ items: data ?? [] });
 }
 
+/** How long a proposed message stays approvable. Config, not a guess about the owner: override with JOBROOM_APPROVAL_TTL_HOURS. */
+export const approvalTtlHours = () => Number(process.env.JOBROOM_APPROVAL_TTL_HOURS) || 24;
+const WAITING_MINUTES = 15;
+
+type Approver = { role: string; audiences: string[]; max_tier: number; may_invoice: boolean; name: string };
+
+/** The sender's number → an active approver, or null. A stranger, technician or customer has no row. */
+async function findApprover(supabase: SupabaseClient, phone: string): Promise<Approver | null> {
+  const contact = await supabase
+    .from('contacts')
+    .select('id, display_name, active')
+    .eq('phone_e164', phone)
+    .maybeSingle();
+  if (!contact.data || contact.data.active === false) return null;
+  const row = await supabase
+    .from('job_approvers')
+    .select('role, audiences, max_tier, may_invoice, active')
+    .eq('contact_id', contact.data.id)
+    .maybeSingle();
+  if (!row.data || row.data.active === false) return null;
+  return {
+    role: String(row.data.role),
+    audiences: (row.data.audiences as string[] | null) ?? [],
+    max_tier: Number(row.data.max_tier) || 0,
+    may_invoice: row.data.may_invoice === true,
+    name: String(contact.data.display_name).slice(0, 80),
+  };
+}
+
+/** What this approver may release. An owner may release everything; an assistant only what was granted. */
+function mayRelease(a: Approver, o: { audience: string; tier: number; kind: string }): string | null {
+  if (a.role === 'owner') return null;
+  if (o.kind.startsWith('invoice:') && !a.may_invoice) return 'invoice';
+  if (o.tier > a.max_tier) return 'tier';
+  if (!a.audiences.includes(o.audience)) return 'audience';
+  return null;
+}
+
 /**
- * POST: a person releases (or refuses) one exact text. The hash they saw must
- * equal the stored one, so an edit after the read-back card cancels the release.
- * In shadow this only moves proposed → approved; nothing is sent.
+ * POST: a person releases (or refuses) one exact text. The sender's number must
+ * belong to an active approver with the right for this kind of message, the
+ * hash they saw must equal the stored one (an edit cancels the release), and
+ * the item must not be older than the approval window. In shadow this only
+ * moves proposed → approved; nothing is sent. A refusal is logged as an event
+ * naming the reason, never the number.
  */
 export async function decideApproval(supabase: SupabaseClient, raw: unknown): Promise<Result> {
   if (!isObject(raw)) return bad('Ongeldige invoer');
   if (!isUuid(raw.outboxId)) return bad('Ongeldig bericht');
   const decision = oneOf(raw.decision, ['approved', 'rejected'] as const);
-  const decidedBy = clean(raw.decidedBy, 80);
   const via = oneOf(raw.via, ['owner_tap', 'owner_voice', 'assistant', 'system'] as const);
   const seenHash = typeof raw.textHash === 'string' ? raw.textHash : '';
-  if (!decision || !decidedBy || !via || !/^[0-9a-f]{64}$/.test(seenHash)) return bad('Ongeldige beslissing');
+  const phone = toE164NL(typeof raw.approverPhone === 'string' ? raw.approverPhone : null);
+  if (!decision || !via || !phone || !/^[0-9a-f]{64}$/.test(seenHash)) return bad('Ongeldige beslissing');
 
   const found = await supabase
     .from('job_outbox')
-    .select('id, job_room_id, state, text_hash')
+    .select('id, job_room_id, contact_id, state, text_hash, audience, tier, kind, created_at')
     .eq('id', raw.outboxId)
     .maybeSingle();
   if (found.error) return bad('Ophalen mislukt', 500);
   if (!found.data) return bad('Bericht niet gevonden', 404);
+
+  const refuse = async (reason: string, status: number, error: string) => {
+    await supabase.from('job_events').insert({
+      job_room_id: found.data!.job_room_id,
+      direction: 'internal',
+      channel: 'system',
+      actor: 'jobroom-approval',
+      kind: 'approval.refused',
+      status: 'blocked',
+      meta: { reason, outboxId: found.data!.id },
+    });
+    return bad(error, status, { reason });
+  };
+
+  const approver = await findApprover(supabase, phone);
+  if (!approver) return refuse('not_approver', 403, 'Geen goedkeuringsrecht');
+  // The channel must match the person: an assistant only through the assistant path, an owner never through it.
+  if ((approver.role === 'assistant') !== (via === 'assistant') && via !== 'system') {
+    return refuse('wrong_channel', 403, 'Verkeerd kanaal');
+  }
+  if (via === 'system') return refuse('system_not_allowed', 403, 'Geen goedkeuringsrecht');
+  const lacking = mayRelease(approver, found.data as { audience: string; tier: number; kind: string });
+  if (lacking) return refuse(`not_allowed_${lacking}`, 403, 'Geen recht voor dit bericht');
+
   if (found.data.state !== 'proposed') return bad('Bericht is al behandeld', 409, { state: found.data.state });
+  const ageHours = (Date.now() - Date.parse(String(found.data.created_at))) / 3_600_000;
+  if (ageHours > approvalTtlHours()) {
+    await supabase.from('job_outbox').update({ state: 'cancelled', last_error: 'verlopen' }).eq('id', found.data.id).eq('state', 'proposed');
+    return refuse('expired', 410, 'Bericht is verlopen');
+  }
   if (found.data.text_hash !== seenHash) return bad('Tekst is gewijzigd', 409);
 
   const ins = await supabase
@@ -467,7 +537,7 @@ export async function decideApproval(supabase: SupabaseClient, raw: unknown): Pr
       job_room_id: found.data.job_room_id,
       decision,
       text_hash: seenHash,
-      decided_by: decidedBy,
+      decided_by: approver.name,
       decided_via: via,
     })
     .select('id, code')
@@ -477,7 +547,7 @@ export async function decideApproval(supabase: SupabaseClient, raw: unknown): Pr
 
   const next =
     decision === 'approved'
-      ? { state: 'approved', approved_by: decidedBy, approved_at: new Date().toISOString() }
+      ? { state: 'approved', approved_by: approver.name, approved_at: new Date().toISOString() }
       : { state: 'cancelled' };
   const upd = await supabase
     .from('job_outbox')
@@ -487,7 +557,30 @@ export async function decideApproval(supabase: SupabaseClient, raw: unknown): Pr
     .select('id');
   if (upd.error || !upd.data?.length) return bad('Bijwerken mislukt', 409);
 
-  return ok({ approvalCode: `A${ins.data.code}`, state: next.state, shadow: true }, 201);
+  return ok({ approvalCode: `A${ins.data.code}`, state: next.state, by: approver.role, shadow: true }, 201);
+}
+
+/**
+ * GET: the owner's summary (09:00, 13:00, 18:00): what waits, and what has
+ * waited more than 15 minutes. Counts and ages only, no message text.
+ */
+export async function approvalSummary(supabase: SupabaseClient, now: Date = new Date()): Promise<Result> {
+  const { data, error } = await supabase
+    .from('job_outbox')
+    .select('id, job_room_id, audience, kind, tier, created_at')
+    .eq('state', 'proposed')
+    .limit(500);
+  if (error) return bad('Ophalen mislukt', 500);
+  const items = (data ?? []).map((o: Row) => ({
+    id: o.id,
+    jobRoomId: o.job_room_id,
+    audience: o.audience,
+    kind: String(o.kind).split(':')[0],
+    tier: o.tier,
+    waitingMinutes: Math.max(0, Math.round((now.getTime() - Date.parse(String(o.created_at))) / 60_000)),
+  }));
+  const late = items.filter((i) => i.waitingMinutes > WAITING_MINUTES).sort((a, b) => b.waitingMinutes - a.waitingMinutes);
+  return ok({ waiting: items.length, waitingOver15: late.length, oldest: late.slice(0, 10) });
 }
 
 // ---------------------------------------------------------------------------

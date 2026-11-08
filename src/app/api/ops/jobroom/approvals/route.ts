@@ -1,9 +1,15 @@
-import { decideApproval, runOps } from '@/lib/opsJobRoom';
+import { approvalSummary, decideApproval, runOps } from '@/lib/opsJobRoom';
 import { createSupabaseAdminClient } from '@/lib/supabase/admin';
 
 export const dynamic = 'force-dynamic';
 
-/** Releases or refuses one exact text (bound to its hash). Shadow: nothing is sent. */
+/** The owner's summary: what waits, and what has waited over 15 minutes. */
+export async function GET(request: Request) {
+  return runOps(request, createSupabaseAdminClient, 'jobroom.approval.summary', (db) => approvalSummary(db));
+}
+
+/**
+ * Releases or refuses one exact text (bound to its hash) for an approver identified by number. Shadow: nothing is sent. */
 export async function POST(request: Request) {
   return runOps(request, createSupabaseAdminClient, 'jobroom.approval', (db, body) =>
     decideApproval(db, body)
