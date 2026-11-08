@@ -99,6 +99,8 @@ const OFFICE_NAV: NavItem[] = [
       { href: '/admin/attributie', label: 'Advertentieklikken' },
       { href: '/admin/whatsapp-advertenties', label: 'WhatsApp en advertenties' },
       { href: '/admin/klikfraude', label: 'Klikfraude' },
+      { href: '/admin/live', label: 'Live' },
+      { href: '/admin/kantoor', label: 'Kantoor' },
     ],
   },
   { label: 'Netwerk', icon: MessageSquare, href: '/admin/netwerk' },

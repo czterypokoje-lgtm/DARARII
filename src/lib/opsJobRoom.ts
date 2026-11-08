@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { checkOps, logOps } from './opsAuth.ts';
+import { heartbeatStatus } from './jobRoomLive.ts';
 import { toE164NL } from './phone.ts';
 
 /**
@@ -581,6 +582,71 @@ export async function approvalSummary(supabase: SupabaseClient, now: Date = new 
   }));
   const late = items.filter((i) => i.waitingMinutes > WAITING_MINUTES).sort((a, b) => b.waitingMinutes - a.waitingMinutes);
   return ok({ waiting: items.length, waitingOver15: late.length, oldest: late.slice(0, 10) });
+}
+
+// ---------------------------------------------------------------------------
+// S8: heartbeat and stop alarm
+// ---------------------------------------------------------------------------
+
+const SERVICE = /^[a-z][a-z0-9_-]{1,39}$/;
+const ALERT_REPEAT_MINUTES = 60;
+
+/** POST: a service says it is alive. Resets any earlier alert so the next silence alerts again. */
+export async function recordHeartbeat(supabase: SupabaseClient, raw: unknown): Promise<Result> {
+  if (!isObject(raw)) return bad('Ongeldige invoer');
+  const service = typeof raw.service === 'string' ? raw.service : '';
+  if (!SERVICE.test(service)) return bad('Ongeldige dienst');
+  const row = { beat_at: new Date().toISOString(), note: clean(raw.note, 200), alerted_at: null };
+  const existing = await supabase.from('job_heartbeats').select('service').eq('service', service).maybeSingle();
+  if (existing.error) return bad('Opslaan mislukt', 500);
+  const done = existing.data
+    ? await supabase.from('job_heartbeats').update(row).eq('service', service)
+    : await supabase.from('job_heartbeats').insert({ service, ...row });
+  if (done.error) return bad('Opslaan mislukt', 500);
+  return ok({ service, ok: true });
+}
+
+/**
+ * GET: which expected services have gone quiet. With `alert` on, and only when
+ * alerts are switched on, the owner gets one Telegram line per stale service,
+ * at most once an hour. The alarm text holds the service name and minutes,
+ * nothing else. Not a job message: nothing here reaches a customer.
+ */
+export async function checkHeartbeats(
+  supabase: SupabaseClient,
+  opts: {
+    expected: string[];
+    alert: boolean;
+    alertsOn: boolean;
+    notify?: (text: string) => Promise<void>;
+    now?: Date;
+  }
+): Promise<Result> {
+  const now = opts.now ?? new Date();
+  const rows = await supabase.from('job_heartbeats').select('service, beat_at, alerted_at');
+  if (rows.error) return bad('Ophalen mislukt', 500);
+  const beats = heartbeatStatus((rows.data ?? []) as never, opts.expected, now);
+
+  const alerted: string[] = [];
+  const canAlert = opts.alert && opts.alertsOn && !!opts.notify;
+  for (const b of beats.filter((x) => x.stale)) {
+    if (!canAlert) continue;
+    const row = (rows.data ?? []).find((r: Row) => r.service === b.service);
+    const last = row?.alerted_at ? Date.parse(String(row.alerted_at)) : 0;
+    if (now.getTime() - last < ALERT_REPEAT_MINUTES * 60_000) continue;
+    const since = b.ageMinutes === null ? 'nog nooit' : `al ${b.ageMinutes} minuten niet`;
+    await opts.notify!(`Waarschuwing: ${b.service} heeft ${since} een teken van leven gegeven.`);
+    const stamp = now.toISOString();
+    if (row) await supabase.from('job_heartbeats').update({ alerted_at: stamp }).eq('service', b.service);
+    else await supabase.from('job_heartbeats').insert({ service: b.service, beat_at: '1970-01-01T00:00:00Z', alerted_at: stamp });
+    alerted.push(b.service);
+  }
+  return ok({
+    services: beats,
+    stale: beats.filter((b) => b.stale).map((b) => b.service),
+    alerted,
+    alertsOn: opts.alertsOn,
+  });
 }
 
 // ---------------------------------------------------------------------------
