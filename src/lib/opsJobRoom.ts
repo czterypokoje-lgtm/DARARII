@@ -330,12 +330,14 @@ export function cleanMeta(meta: unknown): Row {
   if (!isObject(meta)) return {};
   const out: Row = {};
   for (const [k, v] of Object.entries(meta).slice(0, 20)) {
-    if (!/^[a-z][a-z0-9_]{0,39}$/.test(k)) continue;
-    if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+    if (!/^[a-z][a-z0-9_]{0,39}$/.test(k) || /\d{6,}/.test(k)) continue; // a key is a name, not a number in disguise
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      if (String(Math.abs(v)).replace(/\D/g, '').length <= 8) out[k] = v; // 9+ digits could be a phone or account number
+    }
     else if (typeof v === 'boolean') out[k] = v;
     else if (typeof v === 'string') {
       const masked = maskSecrets(v).slice(0, 200);
-      out[k] = findSensitive(masked, ['phone', 'email', 'iban', 'plate']) ? '[verwijderd]' : masked;
+      out[k] = findSensitive(masked, ['phone', 'email', 'iban', 'plate', 'url', 'payment'], { strictPlate: true }) ? '[verwijderd]' : masked;
     }
   }
   return out;
@@ -355,14 +357,16 @@ const PROVIDER_ID = /^[\w.:@=+/-]{1,200}$/;
  * the kinds this module writes itself; the status is always `recorded`.
  * Anything key-like in the text is masked before it is stored.
  */
-export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promise<Result> {
+export async function recordEvent(supabase: SupabaseClient, raw: unknown, opts: { transport?: boolean } = {}): Promise<Result> {
   if (!isObject(raw)) return bad('Ongeldige invoer');
   const direction = oneOf(raw.direction, DIRECTIONS);
   const channel = oneOf(raw.channel, CHANNELS);
   const actor = oneOf(raw.actor, EVENT_ACTORS);
   const kind = typeof raw.kind === 'string' && EVENT_KIND.test(raw.kind) && !RESERVED_KIND.test(raw.kind) ? raw.kind : null;
   if (!direction || !channel || !actor || !kind) return bad('Ongeldige gebeurtenis');
-  if (direction === 'in' && !INBOUND_ACTORS.has(actor)) return bad('Alleen het transport meldt inkomende berichten', 403);
+  // "in" (what a customer wrote) is accepted only on the path that checked the transport credential
+  // (the inbound route), never because the body says actor = transport.
+  if (direction === 'in' && (opts.transport !== true || !INBOUND_ACTORS.has(actor))) return bad('Alleen het transport meldt inkomende berichten', 403);
   if (raw.jobRoomId !== undefined && raw.jobRoomId !== null && !isUuid(raw.jobRoomId)) {
     return bad('Ongeldige klus');
   }
@@ -371,6 +375,12 @@ export async function recordEvent(supabase: SupabaseClient, raw: unknown): Promi
   }
   const providerId = raw.providerMessageId === undefined ? null : String(raw.providerMessageId);
   if (providerId !== null && !PROVIDER_ID.test(providerId)) return bad('Ongeldig bericht-id');
+  // The room must exist, and a contact named on it must belong to that room.
+  if (typeof raw.jobRoomId === 'string') {
+    const room = await supabase.from('job_rooms').select('id, customer_contact_id').eq('id', raw.jobRoomId).maybeSingle();
+    if (!room.data) return bad('Klus niet gevonden', 404);
+    if (typeof raw.contactId === 'string' && !(await isParty(supabase, room.data, raw.contactId))) return bad('Contact hoort niet bij deze klus', 403);
+  }
   const eventKey = clean(raw.eventKey, 150);
 
   const body = typeof raw.body === 'string' ? maskSecrets(raw.body.slice(0, 8000)) : null;
@@ -950,7 +960,7 @@ export async function runOps(
   request: Request,
   getClient: () => SupabaseClient,
   action: string,
-  handler: (supabase: SupabaseClient, input: unknown) => Promise<Result>
+  handler: (supabase: SupabaseClient, input: unknown, request: Request) => Promise<Result>
 ): Promise<Response> {
   const json = (r: Result) =>
     new Response(JSON.stringify(r.body), {
@@ -970,10 +980,21 @@ export async function runOps(
   }
 
   const supabase = getClient();
-  const result = await handler(supabase, input);
+  const result = await handler(supabase, input, request);
   // The action and the outcome, never the message text or the number.
   await logOps(supabase, action, { status: result.status });
   return json(result);
+}
+
+/**
+ * The transport's own credential, separate from OPS_API_TOKEN, sent as `x-transport-token`.
+ * Without JOBROOM_TRANSPORT_TOKEN (32+ characters) nothing counts as inbound (fails closed).
+ */
+export function transportOk(request: Request): boolean {
+  const want = process.env.JOBROOM_TRANSPORT_TOKEN;
+  const got = request.headers.get('x-transport-token') ?? '';
+  if (!want || want.length < 32 || !got) return false;
+  return timingSafeEqual(createHash('sha256').update(got).digest(), createHash('sha256').update(want).digest());
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,7 +1078,7 @@ export async function recordInbound(supabase: SupabaseClient, raw: unknown): Pro
     contactId: saved.id,
     jobRoomId: raw.jobRoomId ?? null,
     body: typeof raw.body === 'string' ? raw.body : null,
-  });
+  }, { transport: true });
   if (ev.status >= 500) return ev;
   return ok(
     { contactId: saved.id, created: saved.created, role: saved.role, duplicate: ev.body.duplicate === true },

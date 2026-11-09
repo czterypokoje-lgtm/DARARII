@@ -15,10 +15,11 @@ import { maskSensitive } from '../src/lib/jobRoomGuard.ts';
 import { toE164NL } from '../src/lib/phone.ts';
 
 const {
-  runOps, openJobRoom, recordEvent, proposeOutbox, decideApproval, listOutbox,
+  runOps, openJobRoom, recordEvent: recordEventUntrusted, proposeOutbox, decideApproval, listOutbox,
   saveContact, resolveContact, resolveNote, recordInbound, proposeInvoice, verifyInvoice, approvalSummary,
   signApproval, verifyApproval, outboxBindingHash, addParty, foldName, guardText, sha256,
 } = jobRoom;
+const recordEvent = (db: any, raw: unknown, opts: { transport?: boolean } = { transport: true }) => recordEventUntrusted(db, raw, opts);
 
 process.env.OPS_API_TOKEN = 'x'.repeat(40);
 const TOKEN = process.env.OPS_API_TOKEN;

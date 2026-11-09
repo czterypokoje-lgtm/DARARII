@@ -14,9 +14,10 @@ import { guardText, maskSensitive } from '../src/lib/jobRoomGuard.ts';
 import { DESKS } from '../src/lib/jobRoomLive.ts';
 
 const {
-  openJobRoom, recordEvent, recordInbound, proposeOutbox, decideApproval, saveContact, addParty,
+  openJobRoom, recordEvent: recordEventUntrusted, recordInbound, proposeOutbox, decideApproval, saveContact, addParty,
   checkHeartbeats, recordHeartbeat, signApproval, outboxBindingHash, mintOwnerApproval, TIER0_TEMPLATES, verifyApproval,
 } = J;
+const recordEvent = (db: any, raw: unknown, opts: { transport?: boolean } = { transport: true }) => recordEventUntrusted(db, raw, opts);
 
 let cases = 0;
 const failures: string[] = [];
@@ -784,6 +785,71 @@ await expect('the invoice greeting is a name, never contact details or a link', 
     assert.equal(/0612|http|evil|NL91|@|pay/i.test(n ?? ''), false, `${bad} -> ${n}`);
   }
   assert.equal(safeGreetingName('a'.repeat(100) + ' b') === null || safeGreetingName('a'.repeat(100) + ' b')!.length <= 40, true);
+});
+
+// ---------------------------------------------------------------------------
+// Review round 4: ordinary quotes are not blocked; real attacks still are
+// ---------------------------------------------------------------------------
+const QUOTE_OK4 = [
+  'EUR 149,50 incl.btw', 'Prijs 120 excl.btw 120', 'Klaar.Bel ons', 'Offerte: sleutel € 149,50 incl.btw, voorrijkosten € 12,50 excl.btw.',
+  'Op dit punt de monteur komt niet verder', 'Op dat punt it werkt', 'Op dit punt be geen zorgen', 'Totaal 25 eur 2 sleutels', 'prijs 21 btw 9', 'Totaal 25 euro 2 stuks', 'Tarief 12 km 3 keer',
+  'Adres Dorpsstraat 12a, 3511AB Utrecht', 'Postcode 3511AB 12', 'tel.nr 5 en ca.nr 6',
+];
+for (const t of QUOTE_OK4) await expect(`ordinary quote passes (customer): ${t.slice(0, 40)}`, () => assert.equal(guardText(t, 'customer_reply'), null, t));
+for (const t of ['EUR 149,50 incl.btw', 'Totaal 25 eur 2 sleutels', 'prijs 21 btw 9', 'Klaar.Bel ons']) {
+  await expect(`ordinary quote passes (technician): ${t}`, () => assert.equal(guardText(t, 'technician'), null, t));
+}
+await expect('a postcode-shaped plate is still caught: plate word nearby, no house number, technician', () => {
+  assert.equal(guardText('Het kenteken is 1234AB', 'customer_reply'), 'plate');
+  assert.equal(guardText('nummerbord 1234AB graag', 'customer_reply'), 'plate');
+  assert.equal(guardText('Auto 1234AB.', 'customer_reply'), 'plate');
+  assert.equal(guardText('Auto 1234AB 12', 'technician'), 'plate');
+  assert.equal(guardText('Auto 1234AB 12', 'customer_reply'), null);
+  assert.equal(guardText('Adres 3511AB Utrecht', 'customer_reply'), null);
+});
+await expect('real links in every written or spelled form are still caught', () => {
+  for (const t of ['Ga naar evil.dev', 'evil punt tk', 'evil dot com', 'evil[.]tk', 'evil (punt) nl', 'EVIL.QQ', 'www.evil.xyz', 'https://evil', 'evil.click/pay', 'bank.top']) {
+    assert.equal(guardText(`Zie ${t}`, 'customer_reply'), 'url', t);
+  }
+});
+await expect('event meta: long numbers, number-like keys, links and payment words are dropped', async () => {
+  const r = await recordEvent(W.db, ev({ meta: { big: 31612345678, edge: 12345678, k123456: 1, link: 'zie evil.tk', pay: 'betaal nu', fine: 'volgorde 3' } }));
+  const meta = W.rows('job_events').find((e) => e.id === r.body.eventId)!.meta as Row;
+  assert.equal('big' in meta, false);
+  assert.equal(meta.edge, 12345678);
+  assert.equal('k123456' in meta, false);
+  assert.equal(meta.link, '[verwijderd]');
+  assert.equal(meta.pay, '[verwijderd]');
+  assert.equal(meta.fine, 'volgorde 3');
+});
+await expect('inbound ("in") is refused unless the transport credential was checked; the body cannot claim it', async () => {
+  const plain = await recordEventUntrusted(W.db, ev({ actor: 'transport' }), {});
+  assert.equal(plain.status, 403);
+  const wacli = await recordEventUntrusted(W.db, ev({ actor: 'wacli' }));
+  assert.equal(wacli.status, 403);
+  const sneaky = await recordEventUntrusted(W.db, { ...ev(), transport: true, opts: { transport: true } });
+  assert.equal(sneaky.status, 403);
+  assert.equal((await recordEventUntrusted(W.db, ev({ direction: 'out', actor: 'crm' }), {})).status, 201);
+});
+await expect('transport credential: separate secret, fails closed', () => {
+  const req = (h: Record<string, string>) => new Request('http://x/api/ops/jobroom/inbound', { method: 'POST', headers: h });
+  const keep = process.env.JOBROOM_TRANSPORT_TOKEN;
+  delete process.env.JOBROOM_TRANSPORT_TOKEN;
+  assert.equal(J.transportOk(req({ 'x-transport-token': 'a'.repeat(40) })), false);
+  process.env.JOBROOM_TRANSPORT_TOKEN = 't'.repeat(40);
+  assert.equal(J.transportOk(req({})), false);
+  assert.equal(J.transportOk(req({ 'x-transport-token': 'x'.repeat(40) })), false);
+  assert.equal(J.transportOk(req({ authorization: `Bearer ${process.env.OPS_API_TOKEN}` })), false);
+  assert.equal(J.transportOk(req({ 'x-transport-token': 't'.repeat(40) })), true);
+  process.env.JOBROOM_TRANSPORT_TOKEN = 'short';
+  assert.equal(J.transportOk(req({ 'x-transport-token': 'short' })), false);
+  if (keep === undefined) delete process.env.JOBROOM_TRANSPORT_TOKEN; else process.env.JOBROOM_TRANSPORT_TOKEN = keep;
+});
+await expect('an event names a room that exists and a contact that belongs to it', async () => {
+  const stranger = ((await saveContact(W.db, { phone: '0600000777', name: 'Vreemde', role: 'customer' })).body.contactId) as string;
+  assert.equal((await recordEvent(W.db, ev({ contactId: stranger }))).status, 403);
+  assert.equal((await recordEvent(W.db, ev({ jobRoomId: randomUUID() }))).status, 404);
+  assert.equal((await recordEvent(W.db, ev({ contactId: W.customer }))).status, 201);
 });
 
 // ---------------------------------------------------------------------------

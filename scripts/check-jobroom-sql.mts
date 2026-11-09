@@ -76,11 +76,11 @@ await pg.exec(`
 
 // --- 1. all five migrations apply, in order, and apply again ---
 const files = [
-  '0078_job_room.sql', '0079_job_outbox_attachment.sql', '0080_job_approvers.sql', '0081_job_heartbeats.sql', '0082_job_room_hardening.sql', '0083_job_room_second_review.sql', '0084_job_room_third_review.sql',
+  '0078_job_room.sql', '0079_job_outbox_attachment.sql', '0080_job_approvers.sql', '0081_job_heartbeats.sql', '0082_job_room_hardening.sql', '0083_job_room_second_review.sql', '0084_job_room_third_review.sql', '0085_job_room_review4.sql',
 ];
 for (const f of files) await pg.exec(readFileSync(`supabase/migrations/${f}`, 'utf8'));
 for (const f of files) await pg.exec(readFileSync(`supabase/migrations/${f}`, 'utf8'));
-ok(true, 'migrations 0078-0084 apply, and apply again (idempotent)');
+ok(true, 'migrations 0078-0085 apply, and apply again (idempotent)');
 
 // --- fixtures (owner and staff contacts need the SQL-only switch of 0083) ---
 await q(`select set_config('app.allow_staff_roles','on',false)`);
@@ -336,17 +336,19 @@ await fails('a body cannot be blanked by hand', `update job_events set body = '[
 await fails('a reason code is required', `select * from job_redact_contact_messages($1, '')`, [victim], /reason/);
 await as('authenticated', () => fails('authenticated cannot redact', `select * from job_redact_contact_messages($1, 'avg-verzoek')`, [victim], /permission denied/i));
 await as('anon', () => fails('anon cannot redact', `select * from job_redact_contact_messages($1, 'avg-verzoek')`, [victim], /permission denied/i));
+await as('service_role', () => fails('erasure refuses while a message is still waiting', `select * from job_redact_contact_messages($1, 'avg-verzoek 2026-11')`, [victim], /unfinished outbox/));
+await q(`update job_outbox set state = 'cancelled' where id = $1`, [vWaiting]);
 const red = await as('service_role', () => rowsOf(`select * from job_redact_contact_messages($1, 'avg-verzoek 2026-11')`, [victim]));
-ok(Number(red[0].events_redacted) === 2 && Number(red[0].outbox_redacted) === 2, 'two events and two finished outbox rows redacted');
+ok(Number(red[0].events_redacted) === 2 && Number(red[0].outbox_redacted) === 3, 'two events and three finished outbox rows redacted (the waiting one after cancelling)');
 const evAfter = (await rowsOf(`select body, meta, redacted_at, kind, direction, channel, contact_id, created_at from job_events where id = $1`, [vEv]))[0];
 ok(evAfter.body === '[verwijderd]' && Object.keys(evAfter.meta).length === 0 && evAfter.redacted_at, 'event body and meta blanked, time stamped');
 ok(evAfter.kind === 'message' && evAfter.direction === 'in' && evAfter.contact_id === victim, 'kind, direction, contact and time are kept');
 const outAfter = await rowsOf(`select id, body, text_hash, state, redacted_at from job_outbox where id = any($1)`, [[vCancelled, vFailed, vWaiting]]);
 ok(outAfter.find((o) => o.id === vCancelled)!.body === '[verwijderd]' && outAfter.find((o) => o.id === vCancelled)!.text_hash === h64('71'), 'finished outbox body blanked, hash kept');
-ok(outAfter.find((o) => o.id === vWaiting)!.body === 'Nog niet verstuurd' && !outAfter.find((o) => o.id === vWaiting)!.redacted_at, 'a waiting message is left alone (cancel it first)');
+ok(outAfter.find((o) => o.id === vWaiting)!.body === '[verwijderd]', 'the formerly waiting message is blanked once cancelled');
 ok((await rowsOf(`select body from job_events where id = $1`, [bystander]))[0].body === 'Ander mens', 'other contacts untouched');
 const privacy = (await rowsOf(`select kind, actor, meta, body from job_events where kind = 'privacy.redacted'`))[0];
-ok(privacy.actor === 'jobroom-privacy' && privacy.meta.events === 2 && privacy.meta.outbox === 2 && privacy.body === null, 'its own event: counts only, no text');
+ok(privacy.actor === 'jobroom-privacy' && privacy.meta.events === 2 && privacy.meta.outbox === 3 && privacy.body === null, 'its own event: counts only, no text');
 ok(!JSON.stringify(privacy).includes('0612'), 'the event holds no message content');
 const again = await as('service_role', () => rowsOf(`select * from job_redact_contact_messages($1, 'avg-verzoek 2026-11')`, [victim]));
 ok(Number(again[0].events_redacted) === 0, 'a second run redacts nothing more');
@@ -383,7 +385,7 @@ await as('service_role', async () => {
   ok(t1.status === 201 && t2.status === 201 && t1.body.outboxId !== t2.body.outboxId, 'same text, other tier: another row');
   ok((await J.proposeOutbox(db, { jobRoomId: roomId, contactId: cust, kind: 'note', tier: 2, body: 'Zelfde tekst voor de test' })).body.duplicate === true, 'same tier: the same row');
   ok((await aud(t1.body.outboxId)).audience === 'self_started', 'the audience hint is ignored: the customer has not written first');
-  await J.recordEvent(db, { direction: 'in', channel: 'whatsapp', actor: 'transport', kind: 'message', jobRoomId: roomId, contactId: cust, providerMessageId: 'wamid.PG1', body: 'Hallo' });
+  await J.recordEvent(db, { direction: 'in', channel: 'whatsapp', actor: 'transport', kind: 'message', jobRoomId: roomId, contactId: cust, providerMessageId: 'wamid.PG1', body: 'Hallo' }, { transport: true });
   const t3 = await J.proposeOutbox(db, { jobRoomId: roomId, contactId: cust, kind: 'note', tier: 1, body: 'Antwoord na hun bericht' });
   ok((await aud(t3.body.outboxId)).audience === 'customer_reply', 'after the customer wrote, the reply is customer_reply');
   const tt = await J.proposeOutbox(db, { jobRoomId: roomId, contactId: tech, kind: 'note', tier: 1, body: 'Naar de monteur' });
@@ -484,4 +486,21 @@ await as('service_role', async () => {
   ok(true, 'a contact without events can be removed');
 });
 
-console.log(`check-jobroom-sql: all passed (${checks} checks, 7 migrations applied twice on a throwaway Postgres)`);
+// --- 19. review round 4: approver row is locked; erasure refuses waiting rows and covers other writers in the job ---
+ok((await rowsOf(`select pg_get_functiondef('public.job_outbox_immutable'::regproc) as d`))[0].d.toLowerCase().includes('for share of ap'), 'the approved check locks the approver row (for share)');
+const v3 = await contact('+31600000501', 'customer', 'Derde Wis');
+const tech3 = await contact('+31600000502', 'technician', 'Monteur Drie');
+const v3Room = (await rowsOf(`insert into job_rooms (customer_contact_id) values ($1) returning id`, [v3]))[0].id;
+await q(`insert into job_events (job_room_id, contact_id, direction, channel, actor, kind, body) values ($1,$2,'out','whatsapp','crm','message','Technicus noteert adres van de klant')`, [v3Room, tech3]);
+await q(`insert into job_events (job_room_id, contact_id, direction, channel, actor, kind, body) values ($1,$2,'internal','crm','crm','note','Notitie van de eigenaar')`, [v3Room, owner]);
+const waiting = await q(`insert into job_outbox (job_room_id, contact_id, audience, tier, kind, body, text_hash, dedupe_key, shadow, state) values ($1,$2,'customer_reply',1,'reply','Wachtend bericht',$3,$3,true,'proposed') returning id`, [v3Room, v3, h64('4a')]);
+await as('service_role', async () => {
+  await fails('erasure refuses while a waiting outbox row exists', `select * from job_redact_contact_messages($1, 'avg-verzoek')`, [v3], /unfinished outbox/);
+  await q(`update job_outbox set state = 'cancelled' where contact_id = $1`, [v3]);
+  const r = await rowsOf(`select * from job_redact_contact_messages($1, 'avg-verzoek 2026-11')`, [v3]);
+  ok(Number(r[0].events_redacted) === 1, "the technician's event in the customer's job is redacted too");
+});
+const own = (await rowsOf(`select body from job_events where job_room_id = $1 and contact_id = $2`, [v3Room, owner]))[0];
+ok(own.body === 'Notitie van de eigenaar', "the owner's own event is not touched");
+
+console.log(`check-jobroom-sql: all passed (${checks} checks, 8 migrations applied twice on a throwaway Postgres)`);

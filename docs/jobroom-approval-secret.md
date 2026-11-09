@@ -1,6 +1,6 @@
 # Job room: approval secret, who mints tokens, roles and erasure
 
-Status: shadow. Nothing here sends a message. Written for the owner's review of migrations 0078 to 0083.
+Status: shadow. Nothing here sends a message. Written for the owner's review of migrations 0078 to 0085.
 
 ## The rule
 
@@ -34,6 +34,10 @@ The secret must be at least 32 characters. With no secret configured the approva
 
 What a token cannot do: approve a row whose text, recipient, audience, tier, kind or attachment changed after the card was shown (the hash covers all of them, and the database refuses such edits anyway); approve twice (one approval per row, enforced by a unique key and a transaction); approve past the 24-hour window; approve something the approver has no right for (`job_approvers`: audiences, highest tier, invoices).
 
+## The transport credential (inbound messages)
+
+`POST /api/ops/jobroom/inbound` (what a customer wrote) needs a second secret besides `OPS_API_TOKEN`: `JOBROOM_TRANSPORT_TOKEN` (32+ characters), sent by the transport as header `x-transport-token`. Without it the route answers 403 and nothing is recorded as "in". `POST /events` refuses `direction: "in"` altogether, whatever `actor` the body claims, so a caller with only the ops token cannot fake a customer message (which is what makes a reply "customer_reply"). An event that names a room and a contact must name a room that exists and a contact that belongs to it.
+
 ## Roles: owner and staff exist only in SQL
 
 `owner` and `staff` contacts unlock the `internal` audience and approver rights, so the API refuses to create them and a contact's role can never change once set (migration 0083 enforces both in the database). To add the owner or the assistant, in the SQL editor, in one run:
@@ -54,7 +58,7 @@ The log tables are append-only on purpose. A deletion request is honoured by bla
 select * from public.job_redact_contact_messages('<contact id>', 'avg-verzoek 2026-11');
 ```
 
-It blanks `body` (and `meta` for events) of that contact's events, of events without a contact id that belong to their own jobs, and of their finished outbox rows (sent, cancelled, failed). It keeps ids, hashes, kinds and times, sets `redacted_at`, and writes one event `privacy.redacted` with counts and the reason code only. Evidence events (`outbox.blocked`, `approval.refused`, `privacy.redacted`: ids, hashes and reason codes) are never blanked. It also **anonymises the contact row** (name, WhatsApp name, city and number replaced, aliases removed, contact deactivated). It refuses owner, staff and approver contacts. Waiting messages (proposed, approved) are not touched: cancel them first. The reason is a code, never personal data. Only the service role and the SQL editor can run it. Deadline: within 30 days of the request (concepts brief).
+It blanks `body` (and `meta` for events) of that contact's events, of events without a contact id that belong to their own jobs, and of their finished outbox rows (sent, cancelled, failed). It keeps ids, hashes, kinds and times, sets `redacted_at`, and writes one event `privacy.redacted` with counts and the reason code only. Evidence events (`outbox.blocked`, `approval.refused`, `privacy.redacted`: ids, hashes and reason codes) are never blanked. It also **anonymises the contact row** (name, WhatsApp name, city and number replaced, aliases removed, contact deactivated). It refuses owner, staff and approver contacts. It also redacts events of the contact's own jobs written by anyone who is not owner, staff or approver. It **refuses while the contact still has unfinished outbox rows** (proposed, approved, claimed, unknown): cancel or finish them first. The reason is a code, never personal data. Only the service role and the SQL editor can run it. Deadline: within 30 days of the request (concepts brief).
 
 **Run it before anything else touches the contact.** A contact that has events can never be deleted (the log points at it, and 0084 refuses the delete with a clear message); after redaction the anonymised row simply stays.
 
@@ -66,7 +70,7 @@ All checks are plain Node scripts (Node 24, no test runner, nothing added to `pa
 node scripts/check-jobroom.mts      # handlers, on an in-memory fake database
 node scripts/check-joblive.mts      # live view logic and the stop alarm
 node scripts/attack-jobroom.mts     # attacks on the guard, approvals, events, tier 0, plus stress
-node scripts/check-jobroom-sql.mts  # migrations 0078 to 0084 on a throwaway Postgres (pglite)
+node scripts/check-jobroom-sql.mts  # migrations 0078 to 0085 on a throwaway Postgres (pglite)
 ```
 
 `check-jobroom-sql.mts` needs `@electric-sql/pglite`. The first run installs it once (pinned to 0.2.17, with npm) into a folder in the system temp directory, so it needs network only that once; after that it runs offline. Set `PGLITE_DIR=<folder>` to use another folder, or `PGLITE_OFFLINE=1` to forbid the install (then it tells you the one command to run by hand: `npm install @electric-sql/pglite@0.2.17 --prefix <folder>`). The database is in memory and thrown away; nothing touches Supabase. The script runs the migrations twice, as the non-superuser roles `service_role` (bypasses RLS), `authenticated` and `anon`, with Supabase-style default grants (every new table granted to all three), and also runs the real handlers against that Postgres. Expected last line: `check-jobroom-sql: all passed (... checks, 7 migrations applied twice ...)`.

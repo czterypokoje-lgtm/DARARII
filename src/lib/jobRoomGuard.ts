@@ -144,7 +144,9 @@ const PLATES = PLATE_FORMATS.map(formatRegex);
 const GROUPINGS = new Set(PLATE_FORMATS.map((f) => f.split('-').map((g) => g.length).join('')));
 
 /** Small words that appear between numbers in ordinary sentences ("08 om 10"); a plate window never spans one. */
-const STOP = new Set(['om', 'op', 'en', 'of', 'in', 'de', 'het', 'uur', 'tot', 'met', 'bij', 'at', 'to', 'on', 'um', 'am', 've', 'is', 'na', 'te', 'van', 'tm', 'ca']);
+const STOP = new Set(['om', 'op', 'en', 'of', 'in', 'de', 'het', 'uur', 'tot', 'met', 'bij', 'at', 'to', 'on', 'um', 'am', 've', 'is', 'na', 'te', 'van', 'tm', 'ca',
+  // units and price words: "25 eur 2 sleutels", "21 btw 9" are quotes, not plates
+  'eur', 'euro', 'btw', 'stuks', 'stuk', 'st', 'km', 'min', 'minuten', 'minuut', 'dag', 'dagen', 'week', 'weken', 'keer', 'maal', 'x', 'per', 'procent', 'korting', 'ex', 'incl', 'excl', 'sleutel', 'sleutels', 'pk', 'kw', 'cm', 'mm', 'jaar', 'maanden']);
 
 const isPlate = (compact: string) =>
   compact.length === 6 && /\d/.test(compact) && /[a-z]/.test(compact) && PLATES.some((p) => p.test(compact));
@@ -155,12 +157,29 @@ const isPlate = (compact: string) =>
  * Needs letters AND digits, so a date never matches, and the group sizes keep
  * "50 voor" from looking like 99-XX-XX.
  */
-function hasPlate(normalized: string): boolean {
+const PLATE_WORDS = /kenteken|nummerbord|nummerplaat|plaat\b|license|licence|plate|\bkent\b/;
+const POSTCODE_SHAPE = /^\d{4}[a-z]{2}$/;
+
+/**
+ * `strict` (texts for a technician) treats a postcode-shaped chunk like 1234AB as a plate too.
+ * Otherwise it is let through only when it reads as a postcode: no plate word within 40 characters,
+ * and followed by a house number or a place name.
+ */
+function postcodeLooksLikePlate(normalized: string, chunk: { text: string; start: number; end: number }, next: { text: string } | undefined, strict: boolean): boolean {
+  if (strict) return true;
+  const near = normalized.slice(Math.max(0, chunk.start - 40), chunk.end + 40);
+  if (PLATE_WORDS.test(near)) return true;
+  const gap = next ? normalized.slice(chunk.end, normalized.indexOf(next.text, chunk.end)) : '';
+  const followed = next && /^[\s,]+$/.test(gap) && (/^\d{1,4}[a-z]?$/.test(next.text) || (/^[a-z]{4,}$/.test(next.text) && !STOP.has(next.text)));
+  return !followed;
+}
+
+function hasPlate(normalized: string, strict = false): boolean {
   const chunks = [...normalized.matchAll(/[a-z0-9]+/g)].map((m) => ({ text: m[0], start: m.index!, end: m.index! + m[0].length }));
   for (let i = 0; i < chunks.length; i++) {
     // Written without separators. "3511AB" is the same shape as sidecode 2 (99-99-XX) and every quote
     // carries postcodes, so that one layout counts as a plate only when it is written with separators.
-    if (isPlate(chunks[i].text) && !/^\d{4}[a-z]{2}$/.test(chunks[i].text)) return true;
+    if (isPlate(chunks[i].text) && (!POSTCODE_SHAPE.test(chunks[i].text) || postcodeLooksLikePlate(normalized, chunks[i], chunks[i + 1], strict))) return true;
     // "AB-12CD": two chunks, hyphen only (a space would make "50 voor" look like 99-XX-XX)
     if (i + 1 < chunks.length && normalized.slice(chunks[i].end, chunks[i + 1].start) === '-' && !STOP.has(chunks[i].text) && !STOP.has(chunks[i + 1].text)) {
       if (isPlate(chunks[i].text + chunks[i + 1].text)) return true;
@@ -229,19 +248,37 @@ function hasIban(normalized: string): boolean {
 }
 
 const COMMON_TLD = 'com|nl|de|net|org|tk|ml|ga|cf|gq|xyz|top|info|biz|io|me|co|eu|be|app|link|click|online|site|shop|store|live|icu|ru|cn|pw|cc|ws|to|ly|gl|tr|uk|fr|es|it|pl|dev|ai|gg|pro|at|ch|vip|cloud';
+/** Real words that are also a TLD: spelled out ("op dit punt de monteur") they are ordinary Dutch, so they only count in written form. */
+const SPELLED_SKIP = new Set(['de', 'it', 'be', 'at', 'to', 'es', 'in', 'me', 'co', 'pl', 'tr', 'top', 'live', 'site', 'shop', 'store', 'online', 'link', 'pro', 'app', 'dev']);
+const SPELLED_TLD = new Set(COMMON_TLD.split('|').filter((t) => !SPELLED_SKIP.has(t)));
+/** Written domain, 3+ letter TLDs: only these. "incl.btw", "Klaar.Bel" are not domains. */
+const GENERIC_TLD = COMMON_TLD + '|club|work|fun|bid|win|loan|men|party|stream|download|review|trade|date|racing|science|accountant|faith|cricket|zip|mov|lol|space|tech|email|support|help|services|solutions|today|world|life|rest|buzz|monster|cyou|sbs|cfd|mom|website|page|digital|network|group|agency|company|center|city|money|bank|finance|loans|cash|credit|win|bet|casino|game|games|xxx|porn|sex|adult|best|ink|icu|one|run|zone|host|press|plus|bio|name|mobi|asia|tel|jobs|travel|museum|aero|coop';
 const SCHEME = '(?:https?:|ftp:)?//[^\\s]+';
 const WWW = '(?<![a-z0-9@.-])www\\.';
-/** A written domain: any label followed by an alphabetic TLD of 2+ letters. "bijv.", "o.a." and "149.50" are not. */
-const URL_OPEN = new RegExp(`${SCHEME}|${WWW}|(?<![a-z0-9@.-])[a-z0-9][a-z0-9-]*\\.[a-z]{2,}(?![a-z0-9])`);
-/** Spelled out ("evil punt tk"): the word "punt" is ordinary Dutch, so only common TLDs count there. */
-const URL_SPELLED = new RegExp(`${SCHEME}|${WWW}|(?<![a-z0-9@.-])[a-z0-9][a-z0-9-]*\\.(?:${COMMON_TLD})(?![a-z0-9])`);
+/** Abbreviations that precede a full stop in quotes and notes: never the left half of a domain. */
+const LEFT_SKIP = new Set(['excl', 'incl', 'ex', 'bijv', 'ca', 'nr', 'tel', 'o', 'a', 'dr', 'mr', 'ir', 'ing', 'drs', 'prof', 'dhr', 'mevr', 'mw', 'enz', 'etc', 'evt', 'max', 'min', 'resp', 'vs', 'zgn', 'tav', 'mbt', 'dwz', 'zsm', 'btw', 'eur', 'st', 'ned', 'adr', 'art', 'bv', 'nv', 'afd']);
+const LEFT_WORDS = new Set(['dit', 'dat', 'deze', 'die', 'het', 'de', 'een', 'op', 'in', 'op', 'er', 'we', 'wij', 'u', 'uw', 'ons', 'onze', 'je', 'jij', 'ik', 'mijn', 'dan', 'nu', 'zo', 'ook', 'maar', 'nog', 'dus', 'van', 'voor', 'met', 'naar', 'bij', 'tot', 'om', 'is', 'zijn', 'was', 'dank', 'tot']);
+const WRITTEN = new RegExp(`(?<![a-z0-9@.-])([a-z0-9][a-z0-9-]*)\\.([a-z]{2,})(?![a-z0-9])`, 'g');
+const ccTLD = /^[a-z]{2}$/;
+const GENERIC = new Set(GENERIC_TLD.split('|'));
 
 function hasUrl(normalized: string): boolean {
-  if (URL_OPEN.test(normalized.replace(/·/g, '.'))) return true;
-  const spelled = normalized
-    .replace(/\s*(?:[([{]\s*(?:dot|punt|\.)\s*[)\]}]|(?<![a-z])(?:dot|punt)(?![a-z]))\s*/g, '.')
-    .replace(/·/g, '.');
-  return URL_SPELLED.test(spelled);
+  const flat = normalized.replace(/·/g, '.');
+  if (new RegExp(`${SCHEME}|${WWW}`).test(flat)) return true;
+  // label.tld: a 2-letter TLD (country code) or a known longer TLD; a left half that is an abbreviation is skipped
+  for (const m of flat.matchAll(WRITTEN)) {
+    const [, left, tld] = m;
+    if (LEFT_SKIP.has(left) || /^\d+$/.test(left)) continue;
+    if (ccTLD.test(tld) || GENERIC.has(tld)) return true;
+  }
+  // spelled out ("evil punt tk"): only a left half that is not an ordinary word, and a TLD that is not an ordinary word
+  const SPELL = /(?<![a-z0-9@.-])([a-z0-9][a-z0-9-]*)\s*(?:[([{]\s*(?:dot|punt|\.)\s*[)\]}]|(?<![a-z])(?:dot|punt)(?![a-z]))\s*([a-z]{2,})(?![a-z0-9])/g;
+  for (const m of flat.matchAll(SPELL)) {
+    const [, left, tld] = m;
+    if (LEFT_WORDS.has(left) || LEFT_SKIP.has(left)) continue;
+    if (SPELLED_TLD.has(tld)) return true;
+  }
+  return false;
 }
 
 const PAYMENT = /betaal|betalen|overmaken|overboeken|stort |storten|tikkie|payconiq|pay now|pay at|payment|betaallink|bitcoin|crypto|gift ?card|cadeaubon|western union|wire transfer|rekeningnummer|bankrekening|bank account|zahlen|zahlung|[uü]berweis|\bode\b|[oö]deme|[oö]deyin|havale|contant|afrekenen|overschrijv|\bpaypal\b|\bidea?l\b/;
@@ -251,7 +288,7 @@ const PAYMENT = /betaal|betalen|overmaken|overboeken|stort |storten|tikkie|payco
 const ORDER: Finding[] = ['secret', 'iban', 'phone', 'email', 'plate', 'url', 'payment'];
 
 /** The first rule a text breaks (among `kinds`, default all), or null. */
-export function findSensitive(text: string, kinds: readonly Finding[] = ORDER): Finding | null {
+export function findSensitive(text: string, kinds: readonly Finding[] = ORDER, opts: { strictPlate?: boolean } = {}): Finding | null {
   const n = normalize(text);
   const test: Record<Finding, () => boolean> = {
     secret: () => hasSecret(text, n),
@@ -259,7 +296,7 @@ export function findSensitive(text: string, kinds: readonly Finding[] = ORDER): 
     phone: () => hasPhone(n),
     email: () => hasEmail(n),
     url: () => hasUrl(n),
-    plate: () => hasPlate(n),
+    plate: () => hasPlate(n, opts.strictPlate === true),
     payment: () => PAYMENT.test(n),
   };
   return ORDER.find((k) => kinds.includes(k) && test[k]()) ?? null;
@@ -274,7 +311,7 @@ export function findSensitive(text: string, kinds: readonly Finding[] = ORDER): 
  */
 export function guardText(text: string, audience: Audience, allow: readonly Finding[] = []): string | null {
   const kinds = (audience === 'internal' ? ['secret', 'url', 'payment'] : ORDER).filter((k) => !allow.includes(k as Finding)) as Finding[];
-  return findSensitive(text, kinds);
+  return findSensitive(text, kinds, { strictPlate: audience === 'technician' });
 }
 
 /** Shows only the last 4 digits of a phone-like run. Dates and times stay. */
