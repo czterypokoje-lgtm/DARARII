@@ -76,7 +76,7 @@ export default async function JobPage({
   const crew = (technicians ?? []) as { id: string; name: string; phone: string | null; active: boolean }[];
   const assigned = crew.find((t) => t.id === job.technician_id);
   const briefingLink = assigned
-    ? waLink(assigned.phone, jobBriefing(job as Parameters<typeof jobBriefing>[0]))
+    ? waLink(assigned.phone, jobBriefing(job as Parameters<typeof jobBriefing>[0], 'assigned'))
     : null;
 
   const offerRows: OfferRow[] = (offers ?? []).map((o) => {

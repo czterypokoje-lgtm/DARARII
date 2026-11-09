@@ -8,6 +8,8 @@
  * tried in this same file).
  */
 
+import { guardText } from './jobRoomGuard.ts';
+
 /**
  * "06 11 75 12 31" -> "31611751231".
  *
@@ -55,10 +57,20 @@ const time = (value: string | null | undefined) => (value ? String(value).slice(
  * The message a technician needs to do the job, in the order they need it:
  * when, where, which car, what work, who to ring.
  *
+ * `stage` 'offer' (default) is everything sent before an award: no customer
+ * phone. 'assigned' is for a job the office already gave to one technician.
+ *
  * No price unless one was quoted — a technician quoting a figure the office
  * never agreed is worse than one who has to ask.
  */
-export function jobBriefing(job: JobBriefing): string {
+export function jobBriefing(job: JobBriefing, stage: 'offer' | 'assigned' = 'offer'): string {
+  // Before the award the technician never gets the customer's number (never-rule),
+  // and free text a customer typed (name, street, notes) is dropped if it holds a
+  // phone number, email, plate or key: it could be used to pass contact details.
+  const customerPhone = stage === 'assigned' ? job.customer_phone : null;
+  const safe = (text: string | null | undefined) =>
+    stage === 'assigned' || !text || guardText(text, 'technician') === null ? text : null;
+  job = { ...job, street: safe(job.street), notes: safe(job.notes), customer_name: safe(job.customer_name) };
   const when = [job.scheduled_date, [time(job.slot_start), time(job.slot_end)].filter(Boolean).join('–')]
     .filter(Boolean)
     .join(' ');
@@ -73,8 +85,8 @@ export function jobBriefing(job: JobBriefing): string {
     address ? `Waar: ${address}` : null,
     job.kenteken ? `Kenteken: ${job.kenteken.toUpperCase()}` : null,
     job.service_type ? `Werk: ${job.service_type}` : null,
-    job.customer_name || job.customer_phone
-      ? `Klant: ${[job.customer_name, job.customer_phone].filter(Boolean).join(' — ')}`
+    job.customer_name || customerPhone
+      ? `Klant: ${[job.customer_name, customerPhone].filter(Boolean).join(' — ')}`
       : null,
     job.quoted_price ? `Afgesproken prijs: € ${Number(job.quoted_price).toFixed(2)}` : null,
     job.notes ? `Let op: ${job.notes}` : null,

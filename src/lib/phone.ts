@@ -11,6 +11,8 @@ export function toE164NL(raw: string | null | undefined): string | null {
   if (!raw) return null;
   const digits = String(raw).replace(/[^\d+]/g, '');
   if (!digits) return null;
+  // 00 is the international prefix: 0049... is +49..., never +31 0049...
+  if (digits.startsWith('00') && !digits.startsWith('+')) return toE164NL(`+${digits.slice(2)}`);
   if (digits.startsWith('+31')) return `+31${digits.slice(3).replace(/^0/, '')}`;
   if (digits.startsWith('0031')) return `+31${digits.slice(4).replace(/^0/, '')}`;
   if (digits.startsWith('06') || digits.startsWith('0')) return `+31${digits.slice(1)}`;
