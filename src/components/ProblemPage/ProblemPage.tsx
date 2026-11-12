@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { SITE_CONFIG, WHATSAPP_URL } from '@/config/site.config';
 import { BIZ_ID } from '@/utils/schema';
-import { getProblemPage, PROBLEM_PAGES, type ProblemPage as Problem } from '@/config/problemPages';
+import { getProblemPage, problemHref, PROBLEM_PAGES, type ProblemPage as Problem } from '@/config/problemPages';
 import SplitHero from '@/components/SplitHero/SplitHero';
 import LeadCaptureForm from '@/components/LeadCaptureForm/LeadCaptureForm';
 import styles from './ProblemPage.module.css';
@@ -20,7 +20,7 @@ import styles from './ProblemPage.module.css';
  * The content lives in src/config/problemPages.ts.
  */
 
-const url = (slug: string) => `${SITE_CONFIG.domain}/${slug}`;
+const url = (page: Problem) => `${SITE_CONFIG.domain}${problemHref(page)}`;
 
 export function problemPageMetadata(slug: string): Metadata {
   const page = getProblemPage(slug);
@@ -28,12 +28,12 @@ export function problemPageMetadata(slug: string): Metadata {
     title: { absolute: page.metaTitle },
     description: page.metaDesc,
     alternates: {
-      canonical: url(page.slug),
-      languages: { 'nl-NL': url(page.slug), 'x-default': url(page.slug) },
+      canonical: url(page),
+      languages: { 'nl-NL': url(page), 'x-default': url(page) },
     },
     openGraph: {
       type: 'website',
-      url: url(page.slug),
+      url: url(page),
       title: page.metaTitle,
       description: page.metaDesc,
       images: [{ url: '/og-image.png', width: 1200, height: 630, alt: `${page.name} — Autosleutel24` }],
@@ -47,15 +47,17 @@ function jsonLd(data: object) {
 }
 
 function schemaFor(page: Problem) {
-  const pageUrl = url(page.slug);
+  const pageUrl = url(page);
+  const trail = [
+    { name: 'Home', item: SITE_CONFIG.domain },
+    ...(page.parent ? [{ name: page.parent.label, item: `${SITE_CONFIG.domain}${page.parent.href}` }] : []),
+    { name: page.name, item: pageUrl },
+  ];
   return [
     {
       '@context': 'https://schema.org',
       '@type': 'BreadcrumbList',
-      itemListElement: [
-        { '@type': 'ListItem', position: 1, name: 'Home', item: SITE_CONFIG.domain },
-        { '@type': 'ListItem', position: 2, name: page.name, item: pageUrl },
-      ],
+      itemListElement: trail.map((t, i) => ({ '@type': 'ListItem', position: i + 1, ...t })),
     },
     {
       '@context': 'https://schema.org',
@@ -105,7 +107,11 @@ export default function ProblemPage({ slug }: { slug: string }) {
       ))}
 
       <SplitHero
-        crumbs={[{ label: 'Home', href: '/' }, { label: page.name }]}
+        crumbs={[
+          { label: 'Home', href: '/' },
+          ...(page.parent ? [page.parent] : []),
+          { label: page.name },
+        ]}
         titleTop={page.titleTop}
         titleAccent={page.titleAccent}
         lead={page.lead}
@@ -305,7 +311,7 @@ export default function ProblemPage({ slug }: { slug: string }) {
                     Autosleutel gestolen →
                   </Link>
                   {others.map((p) => (
-                    <Link key={p.slug} href={`/${p.slug}`} className="seo-hub-link">
+                    <Link key={p.slug} href={problemHref(p)} className="seo-hub-link">
                       {`${p.name} →`}
                     </Link>
                   ))}

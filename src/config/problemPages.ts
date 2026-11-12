@@ -26,6 +26,10 @@ export interface ProblemLink {
 
 export interface ProblemPage {
   slug: string;
+  /** URL path when it is not `/${slug}`, e.g. a page that keeps an existing /diensten/ address. */
+  path?: string;
+  /** Breadcrumb step between Home and this page. */
+  parent?: ProblemLink;
   /** Short name, used in breadcrumbs and link lists. */
   name: string;
   metaTitle: string;
@@ -71,6 +75,113 @@ const NO_TIME = 'Een vaste aankomsttijd op deze pagina. Welke tijd kan, hoort u 
 const PRICE_INCLUDES = 'In de prijs die wij noemen zit het voorrijden, het maken en inleren van de sleutel en de btw.';
 
 export const PROBLEM_PAGES: ProblemPage[] = [
+  /*
+   * Spare key. One page instead of four: /autosleutel-laten-maken,
+   * /autosleutel-kopieren and /diensten/reservesleutel-maken now 301 here
+   * (next.config.ts). /autosleutel-bijmaken-in-de-buurt stays: it is the
+   * nearest-city finder, a "where" page rather than a "what" page.
+   *
+   * Search Console, last 28 days to 12 Nov 2026: these pages shared hundreds
+   * of queries between them and all sat at average position 60-90, while the
+   * homepage ranks for the head terms ("autosleutel bijmaken" 856
+   * impressions at 15.5, "auto sleutel laten maken" 231 at 8.2). This page
+   * keeps the address the menu already links to.
+   */
+  {
+    slug: 'autosleutel-bijmaken',
+    path: '/diensten/autosleutel-bijmaken',
+    parent: { href: '/diensten', label: 'Diensten' },
+    name: 'Autosleutel bijmaken',
+    metaTitle: 'Autosleutel Bijmaken of Reservesleutel Laten Maken',
+    metaDesc:
+      'Nog maar één autosleutel? Laat op locatie een reservesleutel bijmaken: frezen en inleren op uw auto. Wat u nodig heeft en hoe u een prijs voor uw auto krijgt.',
+    titleTop: 'Autosleutel bijmaken?',
+    titleAccent: 'Laat een reserve maken zolang u er nog één heeft',
+    lead:
+      'Heeft u nog een sleutel die werkt, dan maken wij er een bij: wij komen naar de auto, maken de nieuwe sleutel en leren hem in op uw auto. Raakt u ook die laatste sleutel kwijt, dan wordt het een ander werk.',
+    image: {
+      src: '/images/seo/auto-slotenmaker-audi-inleren-amersfoort.webp',
+      alt: 'Originele autosleutel naast een nieuw gemaakte reservesleutel',
+    },
+    now: [
+      {
+        title: 'Controleer of uw sleutel nog goed werkt',
+        desc: 'Start de auto ermee en probeer de knoppen. Doet hij het niet (goed) meer, kijk dan hieronder welk geval bij u past.',
+      },
+      {
+        title: 'Zoek uw papieren',
+        desc: 'Uw legitimatie en het kentekenbewijs van de auto. Zonder die twee maakt de monteur geen sleutel.',
+      },
+      {
+        title: 'Noteer merk, model en bouwjaar',
+        desc: 'En of de auto keyless is (starten met een knop). Meer hoeven wij niet te weten voor een prijs.',
+      },
+      {
+        title: 'Neem contact op',
+        desc: 'Bel, app of vul het formulier in. U krijgt een prijs voor uw auto, inclusief voorrijden en btw, en hoort welke tijden er vrij zijn.',
+      },
+    ],
+    casesTitle: 'Welk geval past bij u?',
+    cases: [
+      {
+        title: 'U heeft één sleutel die goed werkt',
+        desc: 'Dan is het bijmaken: wij maken een tweede sleutel en leren die in op uw auto.',
+      },
+      {
+        title: 'Uw enige sleutel is half kapot',
+        desc: 'Werkt hij nog in het contact, dan kan er nog een bijgemaakt worden. Werkt hij niet meer, dan is het voor ons hetzelfde werk als alle sleutels kwijt.',
+        link: { href: '/autosleutel-afgebroken', label: 'Autosleutel afgebroken of kapot' },
+      },
+      {
+        title: 'U wilt alleen de sleutel zelf bestellen',
+        desc: 'In onze webshop zoekt u een sleutel op kenteken. Of die daarna nog ingeleerd moet worden, verschilt per auto; vraag het ons gerust.',
+        link: { href: '/webshop', label: 'Naar de webshop' },
+      },
+      {
+        title: 'U heeft geen sleutel meer die werkt',
+        desc: 'Dan is het geen bijmaken meer, maar alle sleutels kwijt.',
+        link: { href: '/autosleutel-kwijt', label: 'Autosleutel kwijt' },
+      },
+    ],
+    included: [
+      COME_TO_CAR,
+      'Een nieuwe sleutel maken (frezen) en inleren op uw auto.',
+      PRICE_INCLUDES,
+      'Na de klus krijgt u een factuur.',
+    ],
+    notIncluded: [
+      NO_PROOF,
+      'Een prijs voordat wij weten om welke auto het gaat.',
+      'Uitleg hoe u zelf een sleutel inleert: bij de meeste auto’s is daar speciaal gereedschap voor nodig.',
+      NO_TIME,
+    ],
+    faq: [
+      { q: 'Wat kost een reservesleutel?', a: PRICE_ANSWER },
+      {
+        q: 'Kan ik zomaar een autosleutel laten bijmaken?',
+        a: 'Als de auto van u is wel. De monteur vraagt uw legitimatie en het kentekenbewijs. Is de auto van iemand anders, dan moet de eigenaar of iemand met een machtiging dat kunnen laten zien. Zonder dat bewijs maken wij geen sleutel.',
+      },
+      {
+        q: 'Kan een sleutel gemaakt worden zonder de originele sleutel?',
+        a: 'Ja, maar dat is ander werk dan bijmaken: dan zijn alle sleutels kwijt en wordt de nieuwe sleutel zonder voorbeeld gemaakt en ingeleerd. Kijk daarvoor bij autosleutel kwijt.',
+      },
+      {
+        q: 'Kan ik een autosleutel zelf kopiëren of programmeren?',
+        a: 'Voor de meeste auto’s is speciaal gereedschap nodig om een sleutel in te leren. Wilt u alleen het onderdeel, dan zoekt u in onze webshop een sleutel op kenteken; of die daarna nog ingeleerd moet worden, verschilt per auto.',
+      },
+      { q: 'Waar en wanneer kan de sleutel gemaakt worden?', a: `${COME_TO_CAR} ${WHEN_ANSWER}` },
+    ],
+    related: [
+      { href: '/diensten/transponder-programmeren', label: 'Transponder programmeren' },
+      { href: '/diensten/afstandsbediening-bijmaken', label: 'Afstandsbediening bijmaken' },
+      { href: '/diensten/smart-key-programmeren', label: 'Smart key / keyless programmeren' },
+      { href: '/autosleutel-bestellen-op-kenteken', label: 'Autosleutel op kenteken' },
+      { href: '/merken', label: 'Sleutel bijmaken per automerk' },
+    ],
+    fromServices: ['transponder-programmeren', 'afstandsbediening-bijmaken', 'smart-key-programmeren'],
+    serviceName: 'Autosleutel bijmaken op locatie',
+    serviceType: 'Reservesleutel maken en inleren op locatie',
+  },
   {
     slug: 'autosleutel-werkt-niet',
     name: 'Autosleutel werkt niet',
@@ -357,6 +468,11 @@ export const PROBLEM_PAGES: ProblemPage[] = [
     serviceType: 'Contactslot repareren of vervangen op locatie',
   },
 ];
+
+/** Where a problem page lives. */
+export function problemHref(page: ProblemPage): string {
+  return page.path ?? `/${page.slug}`;
+}
 
 export function getProblemPage(slug: string): ProblemPage {
   const page = PROBLEM_PAGES.find((p) => p.slug === slug);

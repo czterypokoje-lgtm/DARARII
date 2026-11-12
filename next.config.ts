@@ -150,8 +150,9 @@ const nextConfig: NextConfig = {
        * that answers it rather than to the homepage.
        */
       { source: "/autosleutel-bijmaken", destination: "/diensten/autosleutel-bijmaken", permanent: true },
-      { source: "/autosleutel-laten-bijmaken", destination: "/autosleutel-laten-maken", permanent: true },
-      { source: "/autosleutel-namaken", destination: "/autosleutel-kopieren", permanent: true },
+      // Straight to the spare-key page: their old targets now redirect there too.
+      { source: "/autosleutel-laten-bijmaken", destination: "/diensten/autosleutel-bijmaken", permanent: true },
+      { source: "/autosleutel-namaken", destination: "/diensten/autosleutel-bijmaken", permanent: true },
       { source: "/autosleutel-verloren", destination: "/autosleutel-kwijt", permanent: true },
       { source: "/renault-sleutelkaart", destination: "/renault-sleutelkaart-kwijt-of-kapot", permanent: true },
       { source: "/renault-keycard", destination: "/renault-sleutelkaart-kwijt-of-kapot", permanent: true },
@@ -268,6 +269,14 @@ const nextConfig: NextConfig = {
         destination: '/diensten/autosleutel-bijmaken',
         permanent: true,
       },
+      /*
+       * Three more spare-key pages folded into the same one (12 Nov 2026).
+       * Search Console: they split the same queries between them and all sat
+       * at average position 60-90. See src/config/problemPages.ts.
+       */
+      { source: '/autosleutel-laten-maken', destination: '/diensten/autosleutel-bijmaken', permanent: true },
+      { source: '/autosleutel-kopieren', destination: '/diensten/autosleutel-bijmaken', permanent: true },
+      { source: '/diensten/reservesleutel-maken', destination: '/diensten/autosleutel-bijmaken', permanent: true },
 
       /*
        * Alle sleutels kwijt → /autosleutel-kwijt.

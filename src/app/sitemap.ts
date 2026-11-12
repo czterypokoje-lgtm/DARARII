@@ -8,7 +8,7 @@ import { isNoindexBrand, isNoindexCity } from '@/config/thinPages';
 import { SERVICE_REGIONS } from '@/config/regions';
 import { BLOG_POSTS, REDIRECTED_BLOG_SLUGS } from '@/config/services';
 import { lastModifiedFor } from '@/lib/contentDates';
-import { PROBLEM_PAGES } from '@/config/problemPages';
+import { PROBLEM_PAGES, problemHref } from '@/config/problemPages';
 import fs from 'fs';
 import path from 'path';
 
@@ -31,16 +31,16 @@ export default function sitemap(): MetadataRoute.Sitemap {
     /*
      * "in de buurt" is already at position 8.4 with the best click rate of
      * any local query in the export, ranking against the city hub because
-     * nothing answered it directly. "kopieren" is 798 impressions landing on
-     * a 404.
+     * nothing answered it directly. (/autosleutel-kopieren and
+     * /autosleutel-laten-maken were listed here too; since 12 Nov 2026 they
+     * 301 to /diensten/autosleutel-bijmaken, so they are not listed.)
      */
-    '/autosleutel-bijmaken-in-de-buurt', '/autosleutel-kopieren',
+    '/autosleutel-bijmaken-in-de-buurt',
     /*
-     * "laten maken" (17,314 impressions across 212 queries, pos 47) and the
-     * Renault sleutelkaart queries (about 425 impressions, no clicks) had no
-     * page to land on.
+     * The Renault sleutelkaart queries (about 425 impressions, no clicks)
+     * had no page to land on.
      */
-    '/autosleutel-laten-maken', '/renault-sleutelkaart-kwijt-of-kapot',
+    '/renault-sleutelkaart-kwijt-of-kapot',
     // Replaces the twelve cut car brands with the ten motorcycle brands on Dutch roads, as one page.
     '/motorsleutel-bijmaken',
     // Linked from the footer of every page and indexable, but was never
@@ -69,18 +69,20 @@ export default function sitemap(): MetadataRoute.Sitemap {
   }));
 
   // 1b. Problem pages: one per customer problem (src/config/problemPages.ts).
+  // /diensten/autosleutel-bijmaken is one of them now, listed here only.
   const problemPages = PROBLEM_PAGES.map(p => ({
-    url: `${base}/${p.slug}`,
-    lastModified: lastModifiedFor(`/${p.slug}`, 'static'),
+    url: `${base}${problemHref(p)}`,
+    lastModified: lastModifiedFor(problemHref(p), 'static'),
     changeFrequency: 'monthly' as const,
     priority: 0.8,
   }));
 
   // 2. Service Pages
-  // `auto-slotenmaker` and `autosleutel-bijmaken` are standalone route folders
-  // rather than DIENSTEN entries, so they were missing from the sitemap even
-  // though the navigation links to them from every page.
-  const STANDALONE_SERVICES = ['auto-slotenmaker', 'autosleutel-bijmaken'];
+  // `auto-slotenmaker` is a standalone route folder rather than a DIENSTEN
+  // entry, so it was missing from the sitemap even though the navigation
+  // links to it from every page. (`autosleutel-bijmaken` was too; it is a
+  // problem page now and listed above.)
+  const STANDALONE_SERVICES = ['auto-slotenmaker'];
 
   const serviceSlugs = Array.from(
     new Set([...DIENSTEN.filter(s => !REDIRECTED_SERVICE_SLUGS.has(s.slug)).map(s => s.slug), ...STANDALONE_SERVICES])

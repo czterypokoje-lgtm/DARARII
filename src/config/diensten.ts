@@ -79,7 +79,16 @@ export const REDIRECTED_SERVICE_SLUGS = new Set([
    * page on the site using that phrasing at all.
    */
   'sleutel-bijmaken',
+  // Folded into /diensten/autosleutel-bijmaken on 12 Nov 2026 (see src/config/problemPages.ts).
+  'reservesleutel-maken',
 ]);
+
+/** Where each redirected service now lives; must match next.config.ts. */
+export const REDIRECTED_SERVICE_TARGETS: Record<string, string> = {
+  'alle-sleutels-kwijt-auto': '/autosleutel-kwijt',
+  'sleutel-bijmaken': '/diensten/autosleutel-bijmaken',
+  'reservesleutel-maken': '/diensten/autosleutel-bijmaken',
+};
 
 export const DIENSTEN: Service[] = [
   // ── 1. AUTODEUR OPENEN ─────────────────────────────────────

@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { DIENSTEN, REDIRECTED_SERVICE_SLUGS } from '@/config/diensten';
 import { getRelatedBlogPosts } from '@/config/services';
-import { problemPagesForService } from '@/config/problemPages';
+import { problemHref, problemPagesForService } from '@/config/problemPages';
 import { SITE_CONFIG, WHATSAPP_URL } from '@/config/site.config';
 import LeadCaptureForm from '@/components/LeadCaptureForm/LeadCaptureForm';
 import SplitHero from '@/components/SplitHero/SplitHero';
@@ -352,14 +352,19 @@ export default function ServiceLayout({ slug, basePath }: { slug: string; basePa
               <div className={styles.mainContent}>
 
                 {/* Not sure this is the right service? The problem page sorts that out first. */}
-                {problemPagesForService(service.slug).map((p) => (
-                  <p key={p.slug} style={{ margin: 0 }}>
-                    Weet u nog niet precies wat er mis is?{' '}
-                    <Link href={`/${p.slug}`} style={{ color: 'var(--orange-600)', fontWeight: 600 }}>
-                      {`${p.titleTop} Lees wat u nu doet →`}
-                    </Link>
+                {problemPagesForService(service.slug).length > 0 && (
+                  <p style={{ margin: 0 }}>
+                    Liever beginnen bij uw probleem?{' '}
+                    {problemPagesForService(service.slug).map((p, i) => (
+                      <span key={p.slug}>
+                        {i > 0 && ' · '}
+                        <Link href={problemHref(p)} style={{ color: 'var(--orange-600)', fontWeight: 600 }}>
+                          {`${p.name} →`}
+                        </Link>
+                      </span>
+                    ))}
                   </p>
-                ))}
+                )}
 
                 {/* Answer-first steps: the list Google's AI Overview quotes for "wat moet ik doen als…". */}
                 {headings.steps && (

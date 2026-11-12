@@ -39,6 +39,7 @@ export const PAGE_REVISED: Record<string, string> = {
   '/autosleutel-werkt-niet': '2026-11-12',
   '/autosleutel-afgebroken': '2026-11-12',
   '/contactslot-draait-niet': '2026-11-12',
+  '/diensten/autosleutel-bijmaken': '2026-11-12', // rebuilt as the one spare-key page
 };
 
 /** Resolves the lastmod for a path, falling back to its section then the template date. */

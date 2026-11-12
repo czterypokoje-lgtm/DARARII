@@ -1,8 +1,8 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
-import { DIENSTEN, REDIRECTED_SERVICE_SLUGS } from '@/config/diensten';
+import { DIENSTEN, REDIRECTED_SERVICE_TARGETS } from '@/config/diensten';
 import { SITE_CONFIG, WHATSAPP_URL } from '@/config/site.config';
-import { PROBLEM_PAGES } from '@/config/problemPages';
+import { PROBLEM_PAGES, problemHref } from '@/config/problemPages';
 import BrandsMarquee from '@/components/BrandsMarquee/BrandsMarquee';
 import VerifiedReviewBanner from '@/components/VerifiedReviewBanner/VerifiedReviewBanner';
 
@@ -29,16 +29,24 @@ export default function DienstenOverviewPage() {
    * point at the destination -- a redirecting URL declared in structured
    * data hands a crawler a hop it did not need to take.
    */
-  const hrefFor = (slug: string) =>
-    REDIRECTED_SERVICE_SLUGS.has(slug) ? '/autosleutel-kwijt' : `/diensten/${slug}`;
+  /*
+   * Each redirected slug goes to its own destination. This used to send every
+   * redirected service to /autosleutel-kwijt, so "Autosleutel Bijmaken" in the
+   * table opened the lost-key page.
+   */
+  const hrefFor = (slug: string) => REDIRECTED_SERVICE_TARGETS[slug] ?? `/diensten/${slug}`;
+  /* Several services can share one destination; list each page once. */
+  const rows = DIENSTEN.filter(
+    (d, i) => DIENSTEN.findIndex((x) => hrefFor(x.slug) === hrefFor(d.slug)) === i
+  );
 
   const itemListSchema = {
     '@context': 'https://schema.org',
     '@type': 'ItemList',
     '@id': `${SITE_CONFIG.domain}/diensten#lijst`,
     name: 'Autosleutel diensten',
-    numberOfItems: DIENSTEN.length,
-    itemListElement: DIENSTEN.map((dienst, i) => ({
+    numberOfItems: rows.length,
+    itemListElement: rows.map((dienst, i) => ({
       '@type': 'ListItem',
       position: i + 1,
       name: dienst.title,
@@ -80,7 +88,7 @@ export default function DienstenOverviewPage() {
           {[
             { href: '/autosleutel-kwijt', label: 'Autosleutel kwijt' },
             { href: '/autosleutel-gestolen', label: 'Autosleutel gestolen' },
-            ...PROBLEM_PAGES.map((p) => ({ href: `/${p.slug}`, label: p.name })),
+            ...PROBLEM_PAGES.map((p) => ({ href: problemHref(p), label: p.name })),
             { href: '/diensten/auto-openen-zonder-sleutel', label: 'Buitengesloten, sleutel in de auto' },
           ].map((l) => (
             <li key={l.href}>
@@ -100,7 +108,7 @@ export default function DienstenOverviewPage() {
               </tr>
             </thead>
             <tbody>
-              {DIENSTEN.map((s, i) => {
+              {rows.map((s, i) => {
                 const href = hrefFor(s.slug);
                 return (
                   <tr key={i}>
