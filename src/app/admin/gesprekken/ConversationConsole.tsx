@@ -43,6 +43,7 @@ const CHANNEL = {
   phone: { label: 'Telefoon', Icon: Phone },
   whatsapp: { label: 'WhatsApp', Icon: MessageCircle },
   sms: { label: 'SMS', Icon: MessageCircle },
+  webchat: { label: 'Webchat', Icon: MessageCircle },
   unknown: { label: 'Onbekend', Icon: HelpCircle },
 } as const;
 

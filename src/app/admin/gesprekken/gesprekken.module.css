@@ -121,6 +121,7 @@
 
 .ch_phone { background: var(--crm-steel-bg); color: var(--crm-steel); }
 .ch_whatsapp { background: var(--crm-ok-bg); color: var(--crm-ok); }
+.ch_webchat { background: var(--crm-ai-bg); color: var(--crm-ai); }
 
 /* Channel mark on the avatar, so the list reads by shape before it reads by
    text — the same trick the sidebar icons use. */
