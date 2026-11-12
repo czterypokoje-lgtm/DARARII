@@ -8,6 +8,7 @@ import { isNoindexBrand, isNoindexCity } from '@/config/thinPages';
 import { SERVICE_REGIONS } from '@/config/regions';
 import { BLOG_POSTS, REDIRECTED_BLOG_SLUGS } from '@/config/services';
 import { lastModifiedFor } from '@/lib/contentDates';
+import { PROBLEM_PAGES } from '@/config/problemPages';
 import fs from 'fs';
 import path from 'path';
 
@@ -65,6 +66,14 @@ export default function sitemap(): MetadataRoute.Sitemap {
     changeFrequency: 'weekly' as const,
     priority: p === '' ? 1.0 : 0.8,
     images: [`${base}/og-image.png`, `${base}/logo.png`],
+  }));
+
+  // 1b. Problem pages: one per customer problem (src/config/problemPages.ts).
+  const problemPages = PROBLEM_PAGES.map(p => ({
+    url: `${base}/${p.slug}`,
+    lastModified: lastModifiedFor(`/${p.slug}`, 'static'),
+    changeFrequency: 'monthly' as const,
+    priority: 0.8,
   }));
 
   // 2. Service Pages
@@ -145,6 +154,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
 
   return [
     ...corePages,
+    ...problemPages,
     ...servicePages,
     ...regionPages,
     ...cityPages,

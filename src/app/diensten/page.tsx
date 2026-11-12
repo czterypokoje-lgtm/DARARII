@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import Link from 'next/link';
 import { DIENSTEN, REDIRECTED_SERVICE_SLUGS } from '@/config/diensten';
 import { SITE_CONFIG, WHATSAPP_URL } from '@/config/site.config';
+import { PROBLEM_PAGES } from '@/config/problemPages';
 import BrandsMarquee from '@/components/BrandsMarquee/BrandsMarquee';
 import VerifiedReviewBanner from '@/components/VerifiedReviewBanner/VerifiedReviewBanner';
 
@@ -73,6 +74,20 @@ export default function DienstenOverviewPage() {
       <BrandsMarquee />
 
       <div className="container" style={{ padding: '3rem 2rem', maxWidth: 1000, margin: '0 auto' }}>
+        {/* Problem first: a visitor often knows what happened, not which service that is. */}
+        <h2 className={styles.tableTitle}>Wat is er aan de hand?</h2>
+        <ul style={{ listStyle: 'none', padding: 0, margin: '0 0 2.5rem', display: 'grid', gap: '0.6rem', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))' }}>
+          {[
+            { href: '/autosleutel-kwijt', label: 'Autosleutel kwijt' },
+            { href: '/autosleutel-gestolen', label: 'Autosleutel gestolen' },
+            ...PROBLEM_PAGES.map((p) => ({ href: `/${p.slug}`, label: p.name })),
+            { href: '/diensten/auto-openen-zonder-sleutel', label: 'Buitengesloten, sleutel in de auto' },
+          ].map((l) => (
+            <li key={l.href}>
+              <Link href={l.href} className="seo-hub-link">{`${l.label} →`}</Link>
+            </li>
+          ))}
+        </ul>
         <h2 className={styles.tableTitle}>Diensten Overzicht</h2>
         <div className={styles.tableWrap}>
           <table className={styles.priceTable}>

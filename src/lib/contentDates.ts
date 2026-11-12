@@ -35,6 +35,10 @@ export const PAGE_REVISED: Record<string, string> = {
   '/privacybeleid': '2026-08-31',
   '/steden/rotterdam': '2026-08-31',
   '/contact': '2026-08-31',
+  // Problem pages (src/config/problemPages.ts), first published together.
+  '/autosleutel-werkt-niet': '2026-11-12',
+  '/autosleutel-afgebroken': '2026-11-12',
+  '/contactslot-draait-niet': '2026-11-12',
 };
 
 /** Resolves the lastmod for a path, falling back to its section then the template date. */
