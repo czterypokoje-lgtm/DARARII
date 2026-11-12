@@ -60,7 +60,7 @@ check('header constant matches', () => assert.equal(lines(one.csv)[1], FEED_HEAD
 check('ends with single newline', () => assert.ok(one.csv.endsWith('\n') && !one.csv.endsWith('\n\n')));
 check('row is exact', () => assert.equal(lines(one.csv)[2], `${GCLID},,,Job Completed,2026-11-05 11:00:00,149.50,EUR`));
 check('no rows still has header', () => assert.equal(buildAdsFeed([], NOW).csv, `${FEED_FIRST_LINE}\n${FEED_HEADER}\n`));
-check('counts one row', () => assert.deepEqual(one.counts, { rows: 1, skipped_no_click_id: 0, skipped_too_old: 0, skipped_bad_time: 0, skipped_no_value: 0 }));
+check('counts one row', () => assert.deepEqual(one.counts, { rows: 1, skipped_no_click_id: 0, skipped_too_old: 0, skipped_bad_time: 0, skipped_no_value: 0, skipped_duplicate_click: 0, recovered_certain: 0, recovered_likely: 0 }));
 
 /* Amsterdam time */
 check('summer is UTC+2', () => assert.equal(formatAmsterdam('2026-07-01T10:00:00Z'), '2026-07-01 12:00:00'));
@@ -126,7 +126,7 @@ check('junk click id is not a click id', () =>
   assert.equal(buildAdsFeed([job({ leads: { gclid: 'a,b\n=cmd()', created_at: '2026-11-01T08:00:00Z' } })], NOW).counts.skipped_no_click_id, 1));
 check('unfinished job ignored entirely', () => {
   const r = buildAdsFeed([job({ status: 'gepland' })], NOW);
-  assert.deepEqual(r.counts, { rows: 0, skipped_no_click_id: 0, skipped_too_old: 0, skipped_bad_time: 0, skipped_no_value: 0 });
+  assert.deepEqual(r.counts, { rows: 0, skipped_no_click_id: 0, skipped_too_old: 0, skipped_bad_time: 0, skipped_no_value: 0, skipped_duplicate_click: 0, recovered_certain: 0, recovered_likely: 0 });
 });
 
 /* Click before conversion */

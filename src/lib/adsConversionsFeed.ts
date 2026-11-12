@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import type { JobClick } from './adAttribution.ts';
 
 /**
  * The daily Google Ads offline-conversion file, built from finished jobs.
@@ -63,6 +64,11 @@ export interface FeedCounts {
   skipped_too_old: number;
   skipped_bad_time: number;
   skipped_no_value: number;
+  /* A recovered click id that another row of this file already carries, or that two recovered rows share. */
+  skipped_duplicate_click: number;
+  /* Rows whose click id was recovered by src/lib/adAttribution.ts (a subset of `rows`). */
+  recovered_certain: number;
+  recovered_likely: number;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -126,9 +132,16 @@ function pickClick(job: FeedJobRow): { kind: 'gclid' | 'gbraid' | 'wbraid'; id: 
   return null;
 }
 
+/**
+ * `recovered` holds clicks found for jobs that carry none themselves (see
+ * adAttribution.ts), keyed by job id. It is only consulted when the job has no
+ * click id of its own or on its lead, so rows that already work never change.
+ * A recovery carries a click id, a rule and a time, nothing personal.
+ */
 export function buildAdsFeed(
   jobs: readonly FeedJobRow[],
-  now: Date = new Date()
+  now: Date = new Date(),
+  recovered: ReadonlyMap<string, JobClick> = new Map()
 ): { csv: string; counts: FeedCounts } {
   const counts: FeedCounts = {
     rows: 0,
@@ -136,19 +149,46 @@ export function buildAdsFeed(
     skipped_too_old: 0,
     skipped_bad_time: 0,
     skipped_no_value: 0,
+    skipped_duplicate_click: 0,
+    recovered_certain: 0,
+    recovered_likely: 0,
   };
   const cutoff = now.getTime() - CLICK_WINDOW_DAYS * DAY_MS;
   const seen = new Set<string>();
   const out: { ms: number; id: string; line: string }[] = [];
+
+  /*
+   * One click, one job. The matcher already withdraws a click that two jobs
+   * fit; this is the last gate before Google, so it is checked again on the
+   * rows actually in this file: a recovered click id is never added when a
+   * row already carries it, nor when two recovered rows would share it.
+   */
+  const ownIds = new Set<string>();
+  const recoveredUses = new Map<string, number>();
+  for (const job of jobs) {
+    if (job.status !== 'afgerond') continue;
+    const own = pickClick(job);
+    if (own) ownIds.add(own.id);
+    else if (recovered.has(job.id)) {
+      const id = recovered.get(job.id)!.id;
+      recoveredUses.set(id, (recoveredUses.get(id) ?? 0) + 1);
+    }
+  }
 
   for (const job of jobs) {
     if (job.status !== 'afgerond') continue;
     if (seen.has(job.id)) continue;
     seen.add(job.id);
 
-    const click = pickClick(job);
+    const own = pickClick(job);
+    const rec = own ? undefined : recovered.get(job.id);
+    const click = own ?? (rec ? { kind: rec.kind, id: rec.id } : null);
     if (!click) {
       counts.skipped_no_click_id++;
+      continue;
+    }
+    if (rec && (ownIds.has(rec.id) || (recoveredUses.get(rec.id) ?? 0) > 1)) {
+      counts.skipped_duplicate_click++;
       continue;
     }
 
@@ -159,7 +199,9 @@ export function buildAdsFeed(
       continue;
     }
     /* Never before the lead existed; for a phone job, never before the click. */
-    const clickedMs = toMs(job.leads?.created_at) ?? toMs(job.click_captured_at);
+    const clickedMs = rec
+      ? toMs(rec.clickedAt)
+      : (toMs(job.leads?.created_at) ?? toMs(job.click_captured_at));
     if (clickedMs !== null && doneMs < clickedMs) {
       counts.skipped_bad_time++;
       continue;
@@ -177,6 +219,7 @@ export function buildAdsFeed(
 
     const ids = { gclid: '', gbraid: '', wbraid: '' };
     ids[click.kind] = click.id;
+    if (rec) counts[rec.confidence === 'certain' ? 'recovered_certain' : 'recovered_likely']++;
     const line = [ids.gclid, ids.gbraid, ids.wbraid, CONVERSION_NAME, done, value, CONVERSION_CURRENCY]
       .map(csvField)
       .join(',');
