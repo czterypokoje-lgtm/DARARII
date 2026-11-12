@@ -64,6 +64,8 @@ export interface FeedCounts {
   skipped_too_old: number;
   skipped_bad_time: number;
   skipped_no_value: number;
+  /* A recovered click id that another row of this file already carries, or that two recovered rows share. */
+  skipped_duplicate_click: number;
   /* Rows whose click id was recovered by src/lib/adAttribution.ts (a subset of `rows`). */
   recovered_certain: number;
   recovered_likely: number;
@@ -147,12 +149,31 @@ export function buildAdsFeed(
     skipped_too_old: 0,
     skipped_bad_time: 0,
     skipped_no_value: 0,
+    skipped_duplicate_click: 0,
     recovered_certain: 0,
     recovered_likely: 0,
   };
   const cutoff = now.getTime() - CLICK_WINDOW_DAYS * DAY_MS;
   const seen = new Set<string>();
   const out: { ms: number; id: string; line: string }[] = [];
+
+  /*
+   * One click, one job. The matcher already withdraws a click that two jobs
+   * fit; this is the last gate before Google, so it is checked again on the
+   * rows actually in this file: a recovered click id is never added when a
+   * row already carries it, nor when two recovered rows would share it.
+   */
+  const ownIds = new Set<string>();
+  const recoveredUses = new Map<string, number>();
+  for (const job of jobs) {
+    if (job.status !== 'afgerond') continue;
+    const own = pickClick(job);
+    if (own) ownIds.add(own.id);
+    else if (recovered.has(job.id)) {
+      const id = recovered.get(job.id)!.id;
+      recoveredUses.set(id, (recoveredUses.get(id) ?? 0) + 1);
+    }
+  }
 
   for (const job of jobs) {
     if (job.status !== 'afgerond') continue;
@@ -164,6 +185,10 @@ export function buildAdsFeed(
     const click = own ?? (rec ? { kind: rec.kind, id: rec.id } : null);
     if (!click) {
       counts.skipped_no_click_id++;
+      continue;
+    }
+    if (rec && (ownIds.has(rec.id) || (recoveredUses.get(rec.id) ?? 0) > 1)) {
+      counts.skipped_duplicate_click++;
       continue;
     }
 

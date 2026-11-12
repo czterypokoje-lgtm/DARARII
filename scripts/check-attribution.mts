@@ -12,6 +12,7 @@ import {
   clickOf,
   phoneKey,
   recoverClicks,
+  resolveAll,
   resolveJobClick,
   weekStartAmsterdam,
   type AttrClick,
@@ -20,6 +21,7 @@ import {
   type AttrPool,
 } from '../src/lib/adAttribution.ts';
 import { buildAdsFeed, type FeedJobRow } from '../src/lib/adsConversionsFeed.ts';
+import { recordChatPhones } from '../src/lib/attributionData.ts';
 
 let n = 0;
 const check = (name: string, fn: () => void) => {
@@ -34,6 +36,8 @@ const check = (name: string, fn: () => void) => {
 
 const G1 = 'Cj0KCQiA_fixture-gclid1';
 const G2 = 'Cj0KCQiA_fixture-gclid2';
+const G3 = 'Cj0KCQiA_fixture-gclid3';
+const G4 = 'Cj0KCQiA_fixture-gclid4';
 const GB = '0AAAAAD_fixture_gbraid1';
 const WB = '0AAAAAD_fixture_wbraid1';
 const PHONE = '+31 6 1234 5678';
@@ -219,15 +223,18 @@ check('job without completion time gets nothing', () =>
   assert.equal(resolveJobClick(job({ completed_at: null, lead_id: 'lead-1' }), pool({ leads: [lead()] })).status, 'none'));
 
 /* recoverClicks */
+/* Job b is a different customer (own number, own lead): only the number links it to its click. */
+const twoCustomers = () => ({
+  jobs: [job({ id: 'a', lead_id: 'lead-1' }), job({ id: 'b', customer_phone: '0698765432' })],
+  p: pool({ leads: [lead(), lead({ id: 'lead-b', phone: '0698765432', phone_e164: null, gclid: G2 })] }),
+});
 check('only certain by default', () => {
-  const jobs = [job({ id: 'a', lead_id: 'lead-1' }), job({ id: 'b', lead_id: null })];
-  const m = recoverClicks(jobs, pool({ leads: [lead()] }));
-  assert.deepEqual([...m.keys()], ['a']);
+  const { jobs, p } = twoCustomers();
+  assert.deepEqual([...recoverClicks(jobs, p).keys()], ['a']);
 });
 check('likely behind the flag', () => {
-  const jobs = [job({ id: 'a', lead_id: 'lead-1' }), job({ id: 'b', lead_id: null })];
-  const m = recoverClicks(jobs, pool({ leads: [lead()] }), { includeLikely: true });
-  assert.deepEqual([...m.keys()].sort(), ['a', 'b']);
+  const { jobs, p } = twoCustomers();
+  assert.deepEqual([...recoverClicks(jobs, p, { includeLikely: true }).keys()].sort(), ['a', 'b']);
 });
 check('unfinished jobs are skipped', () =>
   assert.equal(recoverClicks([job({ status: 'gepland', lead_id: 'lead-1' })], pool({ leads: [lead()] })).size, 0));
@@ -310,9 +317,10 @@ check('stats split jobs by outcome', () => {
     job({ id: 'none', customer_phone: '0600000000' }),
     job({ id: 'open', status: 'gepland' }),
   ];
+  /* Every customer has a click of their own: one click, one job. */
   const p = pool({
-    leads: [lead({ id: 'lead-1', phone: null, phone_e164: null }), lead({ id: 'lead-9', phone: '0699999999', phone_e164: null, gclid: G2 })],
-    clicks: [click({ claimed_by_job_id: 'viaClaim' })],
+    leads: [lead({ id: 'lead-1', phone: null, phone_e164: null }), lead({ id: 'lead-9', phone: '0699999999', phone_e164: null, gclid: G4 })],
+    clicks: [click({ claimed_by_job_id: 'viaClaim', gclid: G3 })],
   });
   const s = attributionStats(jobs, p);
   assert.equal(s.total.finished, 5);
@@ -331,4 +339,295 @@ check('stats count ambiguous separately', () => {
   assert.equal(s.total.without, 0);
 });
 
-console.log(`attribution: ${n} checks passed`);
+/* ------------------------------------------------------------------ */
+/* Precision: one click, one job. Where two clicks or two jobs could   */
+/* fit, nothing is sent.                                               */
+/* ------------------------------------------------------------------ */
+
+/* chat code with the number stored on the click (migration 0088) */
+const coded = (over: Partial<AttrClick> = {}) => click({ ref: 'K7F2', chat_phone_key: '612345678', ...over });
+check('stored number: code from the job number is certain', () => {
+  const c = recovered(job({ customer_phone: '+31 6 1234 5678' }), pool({ clicks: [coded()] }));
+  assert.equal(c.rule, 'chat_ref');
+  assert.equal(c.confidence, 'certain');
+});
+check('stored number: another number does nothing', () =>
+  assert.equal(resolveJobClick(job(), pool({ clicks: [coded({ chat_phone_key: '687654321' })] })).status, 'none'));
+check('stored number: flagged as shared never matches', () =>
+  assert.equal(resolveJobClick(job(), pool({ clicks: [coded({ chat_phone_conflict: true })] })).status, 'none'));
+check('stored number: no number stored, no chat list, no match', () =>
+  assert.equal(resolveJobClick(job(), pool({ clicks: [coded({ chat_phone_key: null })] })).status, 'none'));
+check('stored number: a garbage key is no key', () =>
+  assert.equal(resolveJobClick(job(), pool({ clicks: [coded({ chat_phone_key: '1234' })] })).status, 'none'));
+check('stored number plus a chat list with the same number: still one number', () =>
+  assert.equal(recovered(job(), pool({ clicks: [coded()], chats: [{ ref: 'K7F2', phone: '+31612345678' }] })).rule, 'chat_ref'));
+check('forwarded link: the chat list names a second number, so nobody matches', () => {
+  const p = pool({ clicks: [coded()], chats: [{ ref: 'K7F2', phone: '0687654321' }] });
+  assert.equal(resolveJobClick(job(), p).status, 'none');
+  assert.equal(resolveJobClick(job({ customer_phone: '0687654321' }), p).status, 'none');
+});
+check('stored number: a click taken by another job is skipped', () =>
+  assert.equal(resolveJobClick(job(), pool({ clicks: [coded({ claimed_by_job_id: 'job-9' })] })).status, 'none'));
+
+/* hard links beat soft ones; soft ones disagreeing means a tie */
+check('code says one click, a phone lead another: tie, nothing is sent', () => {
+  const r = resolveJobClick(job(), pool({ clicks: [coded()], leads: [lead({ gclid: G2 })] }));
+  assert.equal(r.status, 'ambiguous');
+});
+check('code and phone lead agree: the code rule is reported', () =>
+  assert.equal(recovered(job(), pool({ clicks: [coded()], leads: [lead()] })).rule, 'chat_ref'));
+check('a claimed click beats a different phone lead', () => {
+  const c = recovered(job(), pool({ clicks: [click({ claimed_by_job_id: 'job-1', gclid: G1 })], leads: [lead({ gclid: G2 })] }));
+  assert.equal(c.rule, 'claimed_click');
+  assert.equal(c.id, G1);
+});
+check("the job's own lead beats a different code", () => {
+  const c = recovered(job({ lead_id: 'lead-1' }), pool({ leads: [lead()], clicks: [coded({ gclid: G2 })] }));
+  assert.equal(c.rule, 'lead_link');
+  assert.equal(c.id, G1);
+});
+check('a tie never reaches the file, even with likely switched on', () => {
+  const p = pool({ leads: [lead(), lead({ id: 'lead-2', gclid: G2 })] });
+  const m = recoverClicks([job()], p, { includeLikely: true });
+  assert.equal(m.size, 0);
+  const r = buildAdsFeed([feedJob()], NOW, m);
+  assert.equal(r.counts.rows, 0);
+  assert.equal(r.counts.skipped_no_click_id, 1);
+});
+
+/* a customer who clicked twice */
+check('clicked twice, two codes from one number: tie', () => {
+  const p = pool({ clicks: [coded(), coded({ id: 'click-2', ref: 'M3N4', gclid: G2 })] });
+  assert.equal(resolveJobClick(job(), p).status, 'ambiguous');
+});
+check('clicked twice, same ad click id both times: one click', () => {
+  const p = pool({ clicks: [coded({ created_at: '2026-11-03T08:00:00Z' }), coded({ id: 'click-2', ref: 'M3N4', created_at: '2026-11-02T08:00:00Z' })] });
+  const c = recovered(job(), p);
+  assert.equal(c.id, G1);
+  assert.equal(c.clickedAt, '2026-11-02T08:00:00.000Z');
+});
+check('clicked twice, the second click went to another job: the first is left', () => {
+  const p = pool({ clicks: [coded(), coded({ id: 'click-2', ref: 'M3N4', gclid: G2, claimed_by_job_id: 'job-9' })] });
+  assert.equal(recovered(job(), p).id, G1);
+});
+check('clicked twice, the second click came after the job: the first is left', () => {
+  const p = pool({ clicks: [coded(), coded({ id: 'click-2', ref: 'M3N4', gclid: G2, created_at: '2026-11-06T08:00:00Z' })] });
+  assert.equal(recovered(job(), p).id, G1);
+});
+
+/* re-used phone numbers and one click for two jobs */
+const sameNumber = [job({ id: 'job-1' }), job({ id: 'job-2', completed_at: '2026-11-08T10:00:00Z' })];
+check('same number on two finished jobs, one coded click: nobody gets it', () => {
+  const p = pool({ clicks: [coded()] });
+  assert.equal(recoverClicks(sameNumber, p).size, 0);
+  const all = resolveAll(sameNumber, p);
+  assert.deepEqual([...all.values()].map((r) => r.status), ['shared', 'shared']);
+});
+check('same number on two finished jobs, one phone lead: nobody gets it', () =>
+  assert.equal(recoverClicks(sameNumber, pool({ leads: [lead()] }), { includeLikely: true }).size, 0));
+check('same number, but only one job is finished: that job keeps the click', () => {
+  const jobs = [job({ id: 'job-1' }), job({ id: 'job-2', status: 'gepland' })];
+  assert.deepEqual([...recoverClicks(jobs, pool({ clicks: [coded()] })).keys()], ['job-1']);
+});
+check('a repeat customer does not reuse the click of an earlier job with its own lead', () => {
+  const jobs = [job({ id: 'job-1', lead_id: 'lead-1' }), job({ id: 'job-2', completed_at: '2026-11-08T10:00:00Z' })];
+  const m = recoverClicks(jobs, pool({ leads: [lead()] }), { includeLikely: true });
+  assert.deepEqual([...m.keys()], ['job-1']);
+});
+check('a click that a direct job already carries is not handed out again', () => {
+  const jobs = [job({ id: 'job-1', gclid: G1 }), job({ id: 'job-2', customer_phone: '0612345678' })];
+  assert.equal(recoverClicks(jobs, pool({ clicks: [coded()] })).size, 0);
+});
+check('a click carried by an unfinished job is not handed out either', () => {
+  const p = pool({ clicks: [coded()], otherJobs: [{ id: 'job-7', gclid: G1 }] });
+  assert.equal(recoverClicks([job()], p).size, 0);
+  assert.equal(resolveAll([job()], p).get('job-1')?.status, 'shared');
+});
+check("a click on another job's lead counts as carried", () => {
+  const p = pool({ clicks: [coded()], leads: [lead({ id: 'lead-7' })], otherJobs: [{ id: 'job-7', lead_id: 'lead-7' }] });
+  assert.equal(recoverClicks([job()], p).size, 0);
+});
+check('the job itself in otherJobs does not block itself', () => {
+  const p = pool({ clicks: [coded()], otherJobs: [{ id: 'job-1', gclid: null, lead_id: null }] });
+  assert.equal(recoverClicks([job()], p).size, 1);
+});
+check('other jobs with other clicks do not block', () => {
+  const p = pool({ clicks: [coded()], otherJobs: [{ id: 'job-7', gclid: G2 }] });
+  assert.equal(recoverClicks([job()], p).size, 1);
+});
+check('lead_link is not withdrawn for a second job on the same lead (feed behaviour unchanged)', () => {
+  const jobs = [job({ id: 'job-1', lead_id: 'lead-1' }), job({ id: 'job-2', lead_id: 'lead-1' })];
+  assert.deepEqual([...recoverClicks(jobs, pool({ leads: [lead()] })).keys()].sort(), ['job-1', 'job-2']);
+});
+check('a job listed twice is one job', () => {
+  const s = attributionStats([job({ lead_id: 'lead-1' }), job({ lead_id: 'lead-1' })], pool({ leads: [lead()] }));
+  assert.equal(s.total.finished, 1);
+  assert.equal(resolveAll([job(), job()], pool()).size, 1);
+});
+check('stats count shared apart from ambiguous and none', () => {
+  const s = attributionStats(sameNumber, pool({ clicks: [coded()] }));
+  assert.equal(s.total.shared, 2);
+  assert.equal(s.total.ambiguous, 0);
+  assert.equal(s.total.without, 0);
+  assert.equal(s.total.finished, 2);
+});
+
+/* the feed: Google's upload window and click ids already in the file */
+const rec = (id: string, clickedAt: string, rule: 'claimed_click' | 'chat_ref' = 'claimed_click') =>
+  new Map([['job-1', { kind: 'gclid' as const, id, rule, confidence: 'certain' as const, clickedAt }]]);
+check('feed: recovered job completed more than 90 days ago is too old', () => {
+  const r = buildAdsFeed([feedJob({ completed_at: '2026-08-12T12:00:00Z' })], NOW, rec(G1, '2026-08-01T08:00:00Z'));
+  assert.equal(r.counts.skipped_too_old, 1);
+  assert.equal(r.counts.rows, 0);
+});
+check('feed: recovered click older than 90 days from today is too old, though inside the job window', () => {
+  const r = buildAdsFeed([feedJob({ completed_at: '2026-08-14T12:00:00Z' })], NOW, rec(G1, '2026-08-10T08:00:00Z'));
+  assert.equal(r.counts.skipped_too_old, 1);
+});
+check('feed: recovered click exactly at the 90-day edge still goes', () => {
+  const r = buildAdsFeed([feedJob({ completed_at: '2026-08-14T12:00:00Z' })], NOW, rec(G1, '2026-08-13T12:00:00Z'));
+  assert.equal(r.counts.rows, 1);
+});
+check('feed: the same input a day later gives the same row', () => {
+  const m = rec(G1, '2026-11-02T08:00:00Z');
+  const a = buildAdsFeed([feedJob()], NOW, m).csv;
+  const b = buildAdsFeed([feedJob()], new Date('2026-11-12T12:00:00Z'), m).csv;
+  assert.equal(a.split('\n')[2], b.split('\n')[2]);
+});
+check('feed: a recovered click id a direct row already carries is not sent a second time', () => {
+  const m = new Map([['job-2', { kind: 'gclid' as const, id: G1, rule: 'chat_ref' as const, confidence: 'certain' as const, clickedAt: '2026-11-02T08:00:00Z' }]]);
+  const r = buildAdsFeed([feedJob({ gclid: G1, click_captured_at: '2026-11-02T08:00:00Z' }), feedJob({ id: 'job-2' })], NOW, m);
+  assert.equal(r.counts.rows, 1);
+  assert.equal(r.counts.skipped_duplicate_click, 1);
+  assert.equal(r.csv.split(G1).length - 1, 1);
+});
+check('feed: a click id on a direct row via its lead counts as carried too', () => {
+  const m = new Map([['job-2', { kind: 'gclid' as const, id: G1, rule: 'chat_ref' as const, confidence: 'certain' as const, clickedAt: '2026-11-02T08:00:00Z' }]]);
+  const direct = feedJob({ leads: { gclid: G1, created_at: '2026-11-01T08:00:00Z' } });
+  const r = buildAdsFeed([direct, feedJob({ id: 'job-2' })], NOW, m);
+  assert.equal(r.counts.skipped_duplicate_click, 1);
+  assert.equal(r.counts.rows, 1);
+});
+check('feed: two recovered rows with the same click id: neither is sent', () => {
+  const entry = { kind: 'gclid' as const, id: G1, rule: 'chat_ref' as const, confidence: 'certain' as const, clickedAt: '2026-11-02T08:00:00Z' };
+  const r = buildAdsFeed([feedJob(), feedJob({ id: 'job-2' })], NOW, new Map([['job-1', entry], ['job-2', entry]]));
+  assert.equal(r.counts.rows, 0);
+  assert.equal(r.counts.skipped_duplicate_click, 2);
+});
+check('feed: end to end, one coded click and two jobs with that number: no row at all', () => {
+  const jobs = [job({ id: 'job-1' }), job({ id: 'job-2', completed_at: '2026-11-08T10:00:00Z' })];
+  const m = recoverClicks(jobs, pool({ clicks: [coded()] }));
+  const r = buildAdsFeed([feedJob({ id: 'job-1' }), feedJob({ id: 'job-2', completed_at: '2026-11-08T10:00:00Z' })], NOW, m);
+  assert.equal(r.counts.rows, 0);
+  assert.equal(r.counts.recovered_certain, 0);
+});
+check('feed: end to end, one coded click and one job: one row, no number in the file', () => {
+  const m = recoverClicks([job()], pool({ clicks: [coded()] }));
+  const r = buildAdsFeed([feedJob()], NOW, m);
+  assert.equal(r.counts.rows, 1);
+  assert.equal(r.counts.recovered_certain, 1);
+  assert.ok(!/612345678/.test(r.csv));
+});
+check('recovery of a coded click carries no number either', () => {
+  const c = recovered(job(), pool({ clicks: [coded()] }));
+  assert.deepEqual(Object.keys(c).sort(), ['clickedAt', 'confidence', 'id', 'kind', 'rule']);
+  assert.ok(!/612345678/.test(JSON.stringify(c)));
+});
+
+/* writing the number behind a code (the ad-reviews route) */
+interface DbRow {
+  id: string;
+  ref: string;
+  chat_phone_key: string | null;
+  chat_phone_conflict: boolean;
+}
+interface Builder {
+  update(patch: Partial<DbRow>): Builder;
+  select(columns?: string): Builder;
+  eq(column: keyof DbRow, value: unknown): Builder;
+  is(column: keyof DbRow, value: unknown): Builder;
+  maybeSingle(): Promise<{ data: Partial<DbRow> | null; error: null }>;
+  then<T>(done: (value: { data: Partial<DbRow>[] | null; error: null }) => T): Promise<T>;
+}
+const fakeDb = (rows: DbRow[]) => {
+  const from = (): Builder => {
+    let patch: Partial<DbRow> | null = null;
+    let selecting = false;
+    const filters: ((r: DbRow) => boolean)[] = [];
+    const run = () => {
+      const hit = rows.filter((r) => filters.every((f) => f(r)));
+      if (patch) for (const r of hit) Object.assign(r, patch);
+      return hit.map((r) => ({ id: r.id, chat_phone_key: r.chat_phone_key }));
+    };
+    const b: Builder = {
+      update: (p) => ((patch = p), b),
+      select: () => ((selecting = true), b),
+      eq: (col, v) => (filters.push((r) => r[col] === v), b),
+      is: (col, v) => (filters.push((r) => r[col] === v), b),
+      maybeSingle: () => Promise.resolve({ data: run()[0] ?? null, error: null }),
+      then: (done) => Promise.resolve({ data: selecting || !patch ? run() : (run(), null), error: null as null }).then(done),
+    };
+    return b;
+  };
+  return { from } as never;
+};
+const dbRow = (ref: string, key: string | null = null): DbRow => ({ id: `c-${ref}`, ref, chat_phone_key: key, chat_phone_conflict: false });
+const writeChats = async (rows: DbRow[], pairs: { ref: string; phone: string }[]) => ({
+  result: await recordChatPhones(fakeDb(rows), pairs),
+  rows,
+});
+let pending = 0;
+const later = (name: string, fn: () => Promise<void>) => {
+  pending++;
+  fn().then(
+    () => {
+      n++;
+      if (--pending === 0) done();
+    },
+    (e) => {
+      console.error(`FAIL: ${name}`);
+      console.error(e);
+      process.exit(1);
+    }
+  );
+};
+function done() {
+  console.log(`attribution: ${n} checks passed`);
+}
+
+later('chat number: first number is written as last nine digits', async () => {
+  const { result, rows } = await writeChats([dbRow('K7F2')], [{ ref: 'K7F2', phone: '+31 6 1234 5678' }]);
+  assert.equal(result.set, 1);
+  assert.equal(rows[0].chat_phone_key, '612345678');
+  assert.equal(rows[0].chat_phone_conflict, false);
+});
+later('chat number: the same number again changes nothing', async () => {
+  const { result, rows } = await writeChats([dbRow('K7F2', '612345678')], [{ ref: 'K7F2', phone: '0612345678' }]);
+  assert.deepEqual([result.set, result.same, result.conflict], [0, 1, 0]);
+  assert.equal(rows[0].chat_phone_conflict, false);
+});
+later('chat number: a different number never overwrites, it flags the click', async () => {
+  const { result, rows } = await writeChats([dbRow('K7F2', '612345678')], [{ ref: 'K7F2', phone: '0687654321' }]);
+  assert.equal(result.conflict, 1);
+  assert.equal(rows[0].chat_phone_key, '612345678');
+  assert.equal(rows[0].chat_phone_conflict, true);
+});
+later('chat number: two numbers for one code in the same batch flag the click', async () => {
+  const { result, rows } = await writeChats(
+    [dbRow('K7F2')],
+    [{ ref: 'K7F2', phone: '0612345678' }, { ref: 'K7F2', phone: '0687654321' }]
+  );
+  assert.equal(result.conflict, 1);
+  assert.equal(rows[0].chat_phone_conflict, true);
+  assert.equal(rows[0].chat_phone_key, null);
+});
+later('chat number: an unknown code and a too short number write nothing', async () => {
+  const { result, rows } = await writeChats([dbRow('K7F2')], [{ ref: 'ZZZZ', phone: '0612345678' }, { ref: 'K7F2', phone: '12345' }]);
+  assert.equal(result.set, 0);
+  assert.equal(result.skipped, 2);
+  assert.equal(rows[0].chat_phone_key, null);
+});
+later('chat number: the result carries counts, never a number', async () => {
+  const { result } = await writeChats([dbRow('K7F2')], [{ ref: 'K7F2', phone: '0612345678' }]);
+  assert.ok(!/612345678/.test(JSON.stringify(result)));
+});

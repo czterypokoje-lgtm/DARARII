@@ -38,8 +38,30 @@ Skipped: no click id, no value, completed before the click, click older than
 The file always repeats the last 90 days. A row Google already has (same
 click, same name, same time) is ignored, so a repeat fetch does no harm.
 
+## Jobs that came in by phone or WhatsApp
+A job without a click id of its own gets one more look (`src/lib/adAttribution.ts`).
+A click id is added only when the evidence points at ONE click and ONE job:
+- the job's own lead holds a click id (already how the file worked);
+- a person claimed a click for the job (the "ad click" panel on the job);
+- the WhatsApp ad code (`[K7F2]`) of a chat from the job's number points at a
+  click. This needs migration `0088_call_click_chat_phone.sql` and the server
+  that reads the WhatsApp chats to send `phone` with each code to
+  `POST /api/ops/ad-reviews`. Without both, this rule simply does nothing.
+- (off by default) another lead with the same number holds a click id; switch
+  on with `ADS_FEED_INCLUDE_LIKELY=1` only after looking at
+  `GET /api/ops/attribution-stats`.
+
+Nothing is added when two different clicks fit the job (the customer clicked
+twice), when the same code came from two numbers (a forwarded link), or when
+the click is already on another job or fits two jobs (a customer who returns
+with the same number). Those jobs stay without a click id on purpose: a wrong
+click id teaches Google to buy the wrong traffic. A click must be no later
+than the job and no older than 90 days before it. Counts are in the audit log
+(`recovered_certain`, `recovered_likely`, `skipped_duplicate_click`).
+
 ## Not covered
-- Phone-call jobs without a click id.
+- Phone-call jobs without a click id that nobody claimed and no chat or lead
+  ties to the job (a plain call leaves no trace to match).
 - Jobs older than 90 days: Google forgets the click after 90 days.
 - Microsoft Ads (separate file, still manual).
 

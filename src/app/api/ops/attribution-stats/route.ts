@@ -14,13 +14,15 @@ const MAX_CHATS = 2000;
  * Read only, counts only: per week of completion, how many finished jobs there
  * were, how many carry a click id themselves, how many the matcher recovers per
  * rule (lead_link, claimed_click, chat_ref, phone_lead), how many are ambiguous
- * (two different clicks qualify, so nothing is guessed) and how many have none.
- * No ids, no numbers, no names. Same bearer token as the other ops routes.
+ * (two different clicks qualify, so nothing is guessed), how many are shared
+ * (one click fits, but another job holds it or found it too) and how many have
+ * none. No ids, no numbers, no names. Same bearer token as the other ops routes.
  *
- * GET cannot know the WhatsApp chats (the code-to-number link is not stored in
- * the CRM), so chat_ref counts 0 there. POST {chats:[{ref,phone}]} (the same
- * shape as /api/ops/ad-matches) lets the server side include them; the numbers
- * are compared and dropped, never stored or returned.
+ * chat_ref uses the number stored on the click (call_clicks.chat_phone_key,
+ * migration 0088, filled by /api/ops/ad-reviews), exactly like the daily file.
+ * POST {chats:[{ref,phone}]} (the same shape as /api/ops/ad-matches) adds chats
+ * the CRM has not been told about yet; the numbers are compared and dropped,
+ * never stored or returned.
  */
 async function handle(request: Request, chats: AttrChatRef[]) {
   const auth = checkOps(request);
@@ -48,7 +50,12 @@ async function handle(request: Request, chats: AttrChatRef[]) {
     return NextResponse.json({ error: 'Lezen mislukt' }, { status: 500 });
   }
 
-  const stats = attributionStats((jobs.data ?? []) as unknown as AttrJob[], { leads: pool.leads, clicks: pool.clicks, chats });
+  const stats = attributionStats((jobs.data ?? []) as unknown as AttrJob[], {
+    leads: pool.leads,
+    clicks: pool.clicks,
+    otherJobs: pool.otherJobs,
+    chats,
+  });
   await logOps(supabase, 'attribution_stats.read', { weeks, chats: chats.length });
   return NextResponse.json(
     { weeks_back: weeks, chats_supplied: chats.length, ...stats },
