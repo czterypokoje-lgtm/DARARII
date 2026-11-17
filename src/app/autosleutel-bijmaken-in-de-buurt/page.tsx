@@ -9,6 +9,8 @@ import NearestCity from '@/components/NearestCity/NearestCity';
 import ServiceAreaMap from '@/components/ServiceAreaMap/ServiceAreaMap';
 import VerifiedReviewBanner from '@/components/VerifiedReviewBanner/VerifiedReviewBanner';
 import { CITIES } from '@/config/cities';
+import { KeyPriceTable, WatHeeftUNodig } from '@/components/KeyFacts/KeyFacts';
+import { cityPath } from '@/config/cityUrls';
 
 /*
  * The best-converting local query on the site, with nowhere to land.
@@ -133,7 +135,7 @@ export default function InDeBuurt() {
                 {CITIES.filter((c) => c.region === region).map((c) => (
                   <Link
                     key={c.slug}
-                    href={`/steden/${c.slug}`}
+                    href={cityPath(c.slug)}
                     style={{
                       padding: '0.45rem 0.85rem',
                       background: '#fff',
@@ -152,6 +154,10 @@ export default function InDeBuurt() {
           ))}
         </div>
       </section>
+
+      {/* Two euro signs on the whole page before this: the "op locatie" query wants a price too. */}
+      <KeyPriceTable heading="Wat kost een autosleutel bijmaken op locatie?" />
+      <WatHeeftUNodig heading="Wat heeft u nodig als de monteur bij u langskomt?" />
 
       <section className="section">
         <div className="container" style={{ maxWidth: 900 }}>
