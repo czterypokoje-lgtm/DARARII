@@ -1,5 +1,23 @@
 # KeyForCars preview: putting it online
 
+## Status for the next developer (18 Nov 2026)
+
+- **Done:** everything on this branch runs locally against a local Supabase
+  (Docker) with fictional KeyForCars data. All CRM office screens load. Our
+  technician screens and public site return 404. A Turbopack production
+  build passes.
+- **Created, not deployed:** Vercel project `keyforcars-crm` (team Nethoreca).
+  It has no env vars yet and is not connected to git; deploy with the CLI from
+  this folder (`.vercelignore` keeps `.env*` and local data out).
+- **Next:** create the KeyForCars Supabase project (EU), load migrations +
+  `kfc-preview.sql` + `seed-kfc-demo.sql`, set the 5 env vars below on
+  `keyforcars-crm`, deploy, create the 4 logins, run the acceptance checklist.
+- **Never** merge this branch into `main` as is, and never point it at
+  Autosleutel24's Supabase. The plan behind all of this is
+  `docs/kfc-crm-plan.md` (English, Turkish summary at the top).
+- **Not run yet:** the Supabase storage path for stock (`src/lib/kfcStockStore.ts`)
+  against a cloud project; English labels for sign-out and the top search.
+
 Branch `kfc/preview`. One codebase: with `CRM_INSTALL=keyforcars` this app is
 KeyForCars's CRM — dashboard, orders, stock, product finder — and everything
 else (our public site, our CRM modules, crons, webhooks) answers 404. Without
